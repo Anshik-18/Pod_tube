@@ -1,29 +1,27 @@
 'use client';
 
 import { useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { useAuth } from '../providers/AuthProvider';
+import { LogoMark } from '@/components/ui/Logo';
 
 export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
   const router = useRouter();
+  const pathname = usePathname();
 
   useEffect(() => {
     if (!loading && !user) {
-      router.push('/login');
+      router.replace(`/login${pathname && pathname !== '/dashboard' ? `?next=${encodeURIComponent(pathname)}` : ''}`);
     }
-  }, [user, loading, router]);
+  }, [user, loading, router, pathname]);
 
-  if (loading) {
+  if (loading || !user) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-lg">Loading...</div>
+      <div className="flex min-h-screen items-center justify-center bg-canvas">
+        <LogoMark className="h-9 w-9 animate-pulse" />
       </div>
     );
-  }
-
-  if (!user) {
-    return null;
   }
 
   return <>{children}</>;

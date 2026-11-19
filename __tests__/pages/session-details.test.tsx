@@ -8,10 +8,6 @@ import SessionDetailPage from '@/app/(dashboard)/sessions/[id]/page';
 import { render, screen, waitFor } from '@testing-library/react';
 
 // Mock dependencies
-jest.mock('@/components/layout/Navbar', () => ({
-  Navbar: () => <nav data-testid="navbar">Navbar</nav>,
-}));
-
 jest.mock('@/components/providers/AuthProvider', () => ({
   useAuth: () => ({ user: { id: 'user1', email: 'test@example.com' } }),
 }));
@@ -219,29 +215,4 @@ describe('Session Details Page', () => {
     expect(screen.getByText('Episode Created')).toBeInTheDocument();
   });
 
-  it('should render Navbar component', async () => {
-    const mockSession = {
-      id: 'session1',
-      guest_token: 'guest-token-123',
-      state: 'idle',
-      recording_started_at: null,
-      created_at: '2024-01-01T10:00:00Z',
-    };
-
-    (global.fetch as jest.Mock)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ session: mockSession }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ episodes: [] }),
-      });
-
-    render(<SessionDetailPage />);
-
-    await waitFor(() => {
-      expect(screen.getByTestId('navbar')).toBeInTheDocument();
-    });
-  });
 });

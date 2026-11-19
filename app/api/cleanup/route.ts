@@ -1,28 +1,33 @@
 /**
- * Cleanup API endpoint
- * Handles cleanup of old episodes and storage files
- * Can be called manually or via cron job
+ * Cleanup API endpoint — called by a scheduled job (see scripts/cleanup-cron.js).
+ * Requires `Authorization: Bearer <CRON_SECRET>`; disabled when CRON_SECRET is unset.
  */
 
+import { timingSafeEqual } from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { cleanupOldEpisodes, cleanupStuckEpisodes } from '@/lib/cleanup/storage';
 
+function isAuthorized(req: NextRequest): boolean {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) return false;
+  const provided = req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ?? '';
+  const a = Buffer.from(provided);
+  const b = Buffer.from(secret);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export async function POST(req: NextRequest) {
+  if (!isAuthorized(req)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
-    // Optional: Add authentication for manual cleanup
-    // For now, allow unauthenticated (you can add auth later)
     const body = await req.json().catch(() => ({}));
-    const { retentionDays, cleanupStuck } = body;
+    const retentionPeriod = parseInt(process.env.EPISODE_RETENTION_DAYS || '7', 10);
+    const shouldCleanupStuck = body?.cleanupStuck !== false;
 
-    // Get retention period from env or request (default: 7 days)
-    const retentionPeriod = retentionDays || parseInt(process.env.EPISODE_RETENTION_DAYS || '7', 10);
-    const shouldCleanupStuck = cleanupStuck !== false; // Default to true
+    const results: Record<string, unknown> = {};
 
-    console.log(`[Cleanup API] Starting cleanup with retention: ${retentionPeriod} days`);
-
-    const results: any = {};
-
-    // Clean up old episodes
     try {
       results.oldEpisodes = await cleanupOldEpisodes(retentionPeriod);
     } catch (error) {
@@ -30,7 +35,6 @@ export async function POST(req: NextRequest) {
       results.oldEpisodes = { error: error instanceof Error ? error.message : 'Unknown error' };
     }
 
-    // Clean up stuck episodes (optional)
     if (shouldCleanupStuck) {
       try {
         const maxProcessingHours = parseInt(process.env.MAX_PROCESSING_HOURS || '24', 10);
@@ -41,28 +45,9 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    return NextResponse.json({
-      success: true,
-      results,
-      timestamp: new Date().toISOString(),
-    });
+    return NextResponse.json({ success: true, results, timestamp: new Date().toISOString() });
   } catch (error) {
     console.error('[Cleanup API] Error:', error);
-    return NextResponse.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: false, error: 'Cleanup failed' }, { status: 500 });
   }
-}
-
-// GET endpoint for status/health check
-export async function GET() {
-  return NextResponse.json({
-    message: 'Cleanup API is available',
-    retentionDays: parseInt(process.env.EPISODE_RETENTION_DAYS || '7', 10),
-    maxProcessingHours: parseInt(process.env.MAX_PROCESSING_HOURS || '24', 10),
-  });
 }

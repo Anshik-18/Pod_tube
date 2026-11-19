@@ -7,7 +7,14 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { StorageProvider } from './types';
-import Readable from 'stream';
+import { createReadStream } from 'fs';
+import { Readable } from 'stream';
+import { Upload } from '@aws-sdk/lib-storage';
+
+/** Files up to this size go up in one PUT; larger ones use multipart upload. */
+const SINGLE_PUT_MAX_BYTES = 100 * 1024 * 1024;
+const MULTIPART_PART_BYTES = 16 * 1024 * 1024;
+import { stat } from 'fs/promises';
 
 export class S3StorageProvider implements StorageProvider {
   private client: S3Client;
@@ -41,36 +48,69 @@ export class S3StorageProvider implements StorageProvider {
   }
 
   async save(path: string, data: Buffer | NodeJS.ReadableStream): Promise<void> {
-    let body: Buffer;
     if (Buffer.isBuffer(data)) {
-      body = data;
+      await this.client.send(new PutObjectCommand({ Bucket: this.bucket, Key: path, Body: data, ContentType: contentTypeFor(path) }));
     } else {
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of data) {
-        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-      }
-      body = Buffer.concat(chunks);
+      // Streams go up in parts instead of being buffered in memory.
+      await this.multipart(path, data as Readable);
     }
+    console.log(`[Cloudflare R2] Successfully uploaded object: ${path}`);
+  }
 
-    const contentType = path.endsWith('.mp4')
-      ? 'video/mp4'
-      : path.endsWith('.webm')
-      ? 'video/webm'
-      : path.endsWith('.wav')
-      ? 'audio/wav'
-      : path.endsWith('.mp3')
-      ? 'audio/mpeg'
-      : 'application/octet-stream';
+  async saveFile(path: string, localFilePath: string): Promise<void> {
+    const { size } = await stat(localFilePath);
+    if (size <= SINGLE_PUT_MAX_BYTES) {
+      await this.client.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: path,
+          Body: createReadStream(localFilePath),
+          ContentLength: size,
+          ContentType: contentTypeFor(path),
+        })
+      );
+    } else {
+      // Large exports (long multi-person episodes, hour-long tracks): parallel multipart upload,
+      // retried per part, and no 5 GB single-PUT ceiling.
+      await this.multipart(path, createReadStream(localFilePath));
+    }
+    console.log(`[Cloudflare R2] Uploaded ${path} (${(size / (1024 * 1024)).toFixed(1)} MB)`);
+  }
 
-    const command = new PutObjectCommand({
+  private async multipart(path: string, body: Readable): Promise<void> {
+    const upload = new Upload({
+      client: this.client,
+      params: { Bucket: this.bucket, Key: path, Body: body, ContentType: contentTypeFor(path) },
+      partSize: MULTIPART_PART_BYTES,
+      queueSize: 4,
+      leavePartsOnError: false,
+    });
+    await upload.done();
+  }
+
+  async size(path: string): Promise<number | null> {
+    try {
+      const head = await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: path }));
+      return head.ContentLength ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async getSignedDownloadUrl(
+    path: string,
+    { filename, inline, contentType, expiresInSeconds = 3600 }: { filename?: string; inline?: boolean; contentType?: string; expiresInSeconds?: number }
+  ): Promise<string> {
+    const disposition = filename
+      ? `${inline ? 'inline' : 'attachment'}; filename="${filename.replace(/"/g, '')}"`
+      : inline ? 'inline' : 'attachment';
+    const command = new GetObjectCommand({
       Bucket: this.bucket,
       Key: path,
-      Body: body,
-      ContentType: contentType,
+      ResponseContentDisposition: disposition,
+      ResponseContentType: contentType ?? contentTypeFor(path),
     });
-
-    await this.client.send(command);
-    console.log(`[Cloudflare R2] Successfully uploaded object: ${path}`);
+    return getSignedUrl(this.client, command, { expiresIn: expiresInSeconds });
   }
 
   async read(path: string): Promise<Buffer> {
@@ -145,4 +185,14 @@ export class S3StorageProvider implements StorageProvider {
     });
     return getSignedUrl(this.client, command, { expiresIn: expiresInSeconds });
   }
+}
+
+function contentTypeFor(path: string): string {
+  if (path.endsWith('.mp4')) return 'video/mp4';
+  if (path.endsWith('.webm')) return 'video/webm';
+  if (path.endsWith('.mkv')) return 'video/x-matroska';
+  if (path.endsWith('.wav')) return 'audio/wav';
+  if (path.endsWith('.mp3')) return 'audio/mpeg';
+  if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return 'image/jpeg';
+  return 'application/octet-stream';
 }

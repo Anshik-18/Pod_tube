@@ -1,37 +1,58 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process';
 import {
   claimNextPendingProcessingJob,
   updateProcessingJobStatus,
+  requeueStaleProcessingJobs,
   ProcessingJob,
 } from '../db/queries/processing-jobs';
-import { processJob } from './process-job';
+import { getEpisodeById, updateEpisodeState } from '../db/queries/episodes';
+import { updateSessionState } from '../db/queries/sessions';
+import { finishStalledSessions } from '../sessions/completion';
 
-const execAsync = promisify(exec);
+/** A session waiting on uploads that show no activity for this long is processed with what arrived. */
+const STALLED_UPLOAD_MINUTES = 10;
+import { processJob } from './process-job';
+import { getFFmpegBin } from './ffmpeg';
 
 export interface ProcessingWorkerOptions {
   /** Polling interval in milliseconds (default: 3000ms) */
   pollIntervalMs?: number;
 }
 
+/** Minimum gap between progress writes to the database. */
+const PROGRESS_WRITE_INTERVAL_MS = 1500;
+/** A 'processing' job with no progress heartbeat for this long belonged to a dead worker. */
+const STALE_JOB_MINUTES = 15;
+const STALE_SWEEP_INTERVAL_MS = 60_000;
+
 /**
- * Verify that FFmpeg is installed and accessible in the system environment.
- * Fails fast if FFmpeg is not found.
+ * Verify that FFmpeg is installed and accessible. Fails fast if FFmpeg is not found.
  */
-export async function verifyFFmpegExists(): Promise<boolean> {
-  try {
-    const ffmpegBin = process.env.FFMPEG_PATH ? `"${process.env.FFMPEG_PATH}"` : 'ffmpeg';
-    const { stdout } = await execAsync(`${ffmpegBin} -version`);
-    const versionLine = stdout.split('\n')[0];
-    console.log(`[Worker] ✓ FFmpeg verified: ${versionLine.trim()}`);
-    return true;
-  } catch (error: any) {
-    console.error('[Worker] ✗ FFmpeg not found.');
-    console.error('[Worker] Please install FFmpeg before starting the processing worker.');
-    console.error('[Worker] Actual error:', error?.message || error);
-    if (error?.stderr) console.error('[Worker] stderr:', error.stderr);
-    return false;
-  }
+export function verifyFFmpegExists(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn(getFFmpegBin(), ['-version'], { windowsHide: true });
+    let stdout = '';
+    child.stdout.on('data', (c: Buffer) => (stdout += c.toString()));
+    child.on('error', (error) => {
+      console.error('[Worker] ✗ FFmpeg not found. Install FFmpeg or set FFMPEG_PATH.', error.message);
+      resolve(false);
+    });
+    child.on('close', (code) => {
+      if (code === 0) {
+        console.log(`[Worker] ✓ FFmpeg verified: ${stdout.split('\n')[0].trim()}`);
+        resolve(true);
+      } else {
+        console.error(`[Worker] ✗ FFmpeg exited with code ${code}`);
+        resolve(false);
+      }
+    });
+  });
+}
+
+/** Keep the first line of an FFmpeg error readable for the UI; full detail stays in logs. */
+function userFacingError(error: unknown): string {
+  const message = (error as Error)?.message || 'Unknown processing error';
+  return message.length > 1000 ? `${message.slice(0, 1000)}…` : message;
 }
 
 export class ProcessingWorker {
@@ -39,18 +60,14 @@ export class ProcessingWorker {
   private timer: NodeJS.Timeout | null = null;
   private pollIntervalMs: number;
   private isPolling = false;
+  private lastStaleSweep = 0;
 
   constructor(options: ProcessingWorkerOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 3000;
   }
 
-  /**
-   * Start the processing worker polling loop.
-   * Verifies FFmpeg availability first; fails fast if FFmpeg is not found.
-   */
   public async start(): Promise<boolean> {
     if (this.isRunning) {
-      console.log('[Worker] ProcessingWorker is already running.');
       return true;
     }
 
@@ -66,12 +83,8 @@ export class ProcessingWorker {
     return true;
   }
 
-  /**
-   * Stop the processing worker loop gracefully.
-   */
   public stop(): void {
     if (!this.isRunning) return;
-
     this.isRunning = false;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -80,50 +93,70 @@ export class ProcessingWorker {
     console.log('[Worker] Worker stopped');
   }
 
-  /**
-   * Poll for and execute pending jobs sequentially.
-   */
+  private async runJob(job: ProcessingJob): Promise<void> {
+    console.log(`[Worker] Job claimed: ${job.id} (episode: ${job.episode_id})`);
+
+    let lastWrite = 0;
+    let lastPercent = -1;
+    // Serialize progress writes so none can land after the final status update.
+    let progressWrites: Promise<unknown> = Promise.resolve();
+    const onProgress = (percent: number) => {
+      const now = Date.now();
+      if (percent <= lastPercent || now - lastWrite < PROGRESS_WRITE_INTERVAL_MS) return;
+      lastPercent = percent;
+      lastWrite = now;
+      progressWrites = progressWrites
+        .then(() => updateProcessingJobStatus(job.id, 'processing', null, percent))
+        .catch(() => {});
+    };
+
+    try {
+      await updateEpisodeState(job.episode_id, 'processing');
+      await updateProcessingJobStatus(job.id, 'processing', null, 0);
+      try {
+        await processJob(job, onProgress);
+      } finally {
+        await progressWrites;
+      }
+      await updateProcessingJobStatus(job.id, 'completed', null, 100);
+      console.log(`[Worker] Job completed: ${job.id}`);
+    } catch (error) {
+      const errorMessage = userFacingError(error);
+      console.error(`[Worker] Job failed: ${job.id} -`, (error as Error)?.message || error);
+      await updateProcessingJobStatus(job.id, 'failed', errorMessage).catch(() => {});
+      await updateEpisodeState(job.episode_id, 'failed').catch(() => {});
+      const episode = await getEpisodeById(job.episode_id).catch(() => null);
+      if (episode) {
+        await updateSessionState(episode.session_id, 'failed').catch(() => {});
+      }
+    }
+  }
+
   public async poll(): Promise<void> {
     if (this.isPolling || !this.isRunning) return;
     this.isPolling = true;
+    let claimed = false;
 
     try {
-      // 1. Atomically claim the next pending job (pending -> processing)
+      if (Date.now() - this.lastStaleSweep > STALE_SWEEP_INTERVAL_MS) {
+        this.lastStaleSweep = Date.now();
+        const requeued = await requeueStaleProcessingJobs(STALE_JOB_MINUTES);
+        if (requeued > 0) console.warn(`[Worker] Requeued ${requeued} stale job(s)`);
+        const finished = await finishStalledSessions(STALLED_UPLOAD_MINUTES).catch(() => []);
+        if (finished.length) console.warn(`[Worker] Finished ${finished.length} session(s) whose remaining uploads stalled: ${finished.join(', ')}`);
+      }
+
       const job = await claimNextPendingProcessingJob();
-
       if (job) {
-        // 2. Log lifecycle: Job claimed & Job started
-        console.log(`[Worker] Job claimed: ${job.id} (episode: ${job.episode_id})`);
-        console.log(`[Worker] Job started: ${job.id}`);
-
-        try {
-          // 3. Execute job media processing pipeline
-          await processJob(job);
-
-          // 4. Update status: processing -> completed
-          await updateProcessingJobStatus(job.id, 'completed', null, 100);
-          console.log(`[Worker] Job completed: ${job.id}`);
-        } catch (error: any) {
-          // 5. Update status: processing -> failed with error message
-          const errorMessage = error?.message || 'Unknown processing error';
-          await updateProcessingJobStatus(job.id, 'failed', errorMessage);
-          console.error(`[Worker] Job failed: ${job.id} - Error: ${errorMessage}`);
-        }
-
-        // Immediately check if there are more pending jobs
-        this.isPolling = false;
-        if (this.isRunning) {
-          setImmediate(() => this.poll());
-        }
-        return;
+        claimed = true;
+        await this.runJob(job);
       }
     } catch (error: any) {
       console.error(`[Worker] Error during poll cycle:`, error?.message || error);
     } finally {
       this.isPolling = false;
-      if (this.isRunning) {
-        this.scheduleNextPoll(this.pollIntervalMs);
-      }
+      // Drain the queue back-to-back; otherwise wait for the next poll interval.
+      this.scheduleNextPoll(claimed ? 0 : this.pollIntervalMs);
     }
   }
 

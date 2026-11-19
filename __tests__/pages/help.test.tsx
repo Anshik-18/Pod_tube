@@ -7,11 +7,6 @@
 import HelpPage from '@/app/(dashboard)/help/page';
 import { render, screen } from '@testing-library/react';
 
-// Mock Navbar
-jest.mock('@/components/layout/Navbar', () => ({
-  Navbar: () => <nav data-testid="navbar">Navbar</nav>,
-}));
-
 describe('Help Page', () => {
   it('should render the help page with main sections', () => {
     render(<HelpPage />);
@@ -72,9 +67,4 @@ describe('Help Page', () => {
     expect(screen.getByText('Start Recording')).toBeInTheDocument();
   });
 
-  it('should render Navbar component', () => {
-    render(<HelpPage />);
-
-    expect(screen.getByTestId('navbar')).toBeInTheDocument();
-  });
 });

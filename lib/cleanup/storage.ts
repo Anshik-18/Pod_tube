@@ -5,7 +5,16 @@
 
 import { getStorageProvider } from '@/lib/storage';
 import { getEpisodeById, deleteEpisode } from '@/lib/db/queries/episodes';
-import { getUploadsBySessionId } from '@/lib/db/queries/uploads';
+import { getAllSessionChunks } from '@/lib/db/queries/chunks';
+
+/** Collect every storage key in a (possibly nested) file_references object. */
+function collectStorageKeys(value: unknown, into: Set<string>): void {
+  if (typeof value === 'string') {
+    if (value.trim().length > 0 && value.includes('/')) into.add(value);
+  } else if (value && typeof value === 'object') {
+    for (const nested of Object.values(value)) collectStorageKeys(nested, into);
+  }
+}
 
 export interface CleanupStats {
   episodesDeleted: number;
@@ -36,28 +45,29 @@ export async function deleteEpisodeWithStorageCleanup(episodeId: string): Promis
   const storage = getStorageProvider();
   const keysToDelete = new Set<string>();
 
-  // Extract all file references from episode record
-  if (episode.file_references) {
-    for (const [key, val] of Object.entries(episode.file_references)) {
-      if (typeof val === 'string' && val.trim().length > 0 && val.includes('/')) {
-        keysToDelete.add(val);
-      }
+  // Every exported file and saved participant track referenced by the episode
+  collectStorageKeys(episode.file_references, keysToDelete);
+
+  // Standard output keys, in case file_references was never written
+  keysToDelete.add(`episodes/${episodeId}/episode.mp4`);
+  keysToDelete.add(`episodes/${episodeId}/audio.mp3`);
+  keysToDelete.add(`episodes/${episodeId}/thumbnail.jpg`);
+
+  // Raw chunks left behind by an unfinished or failed recording
+  try {
+    for (const chunk of await getAllSessionChunks(episode.session_id)) {
+      keysToDelete.add(chunk.storage_key);
     }
+  } catch (error) {
+    console.warn(`[Episode Delete] Could not list chunks for session ${episode.session_id}:`, error);
   }
 
-  // Always check standard key pattern: episodes/<episodeId>/episode.mp4
-  keysToDelete.add(`episodes/${episodeId}/episode.mp4`);
-
-  console.log(`[Episode Delete] Deleting storage keys for episode ${episodeId}:`, Array.from(keysToDelete));
 
   // Step 3: Delete every referenced object using StorageProvider.delete()
   for (const storageKey of keysToDelete) {
     try {
-      const exists = await storage.exists(storageKey);
-      if (exists) {
-        await storage.delete(storageKey);
-        console.log(`[Episode Delete] Successfully deleted storage object: ${storageKey}`);
-      }
+      // delete() is a no-op for missing objects on both providers
+      await storage.delete(storageKey);
     } catch (error: any) {
       console.error(`[Episode Delete] Failed to delete storage object ${storageKey}:`, error);
       throw new Error(`Storage deletion failed for ${storageKey}: ${error?.message || error}`);
@@ -66,34 +76,6 @@ export async function deleteEpisodeWithStorageCleanup(episodeId: string): Promis
 
   // Step 4: Only after successful storage deletion, delete the episode database record
   await deleteEpisode(episodeId);
-  console.log(`[Episode Delete] Successfully deleted database record for episode ${episodeId}`);
-}
-
-/**
- * Delete raw recording files for a session
- * This is called after processing completes
- */
-export async function cleanupRawRecordings(sessionId: string): Promise<number> {
-  const storage = getStorageProvider();
-  const uploads = await getUploadsBySessionId(sessionId);
-  let deletedCount = 0;
-
-  for (const upload of uploads) {
-    if (upload.file_reference && upload.status === 'completed') {
-      try {
-        const exists = await storage.exists(upload.file_reference);
-        if (exists) {
-          await storage.delete(upload.file_reference);
-          deletedCount++;
-          console.log(`[Cleanup] Deleted raw recording: ${upload.file_reference}`);
-        }
-      } catch (error) {
-        console.warn(`[Cleanup] Failed to delete raw recording ${upload.file_reference}:`, error);
-      }
-    }
-  }
-
-  return deletedCount;
 }
 
 /**
@@ -152,8 +134,8 @@ async function getAllEpisodes() {
 }
 
 /**
- * Clean up failed or stuck processing jobs
- * Removes episodes that have been in 'processing' state for too long
+ * Mark episodes that have been stuck in 'processing' for too long as failed, so the owner
+ * sees an error with a Retry button instead of an endless spinner. Nothing is deleted.
  */
 export async function cleanupStuckEpisodes(maxProcessingHours: number = 24): Promise<CleanupStats> {
   const stats: CleanupStats = {
@@ -166,34 +148,43 @@ export async function cleanupStuckEpisodes(maxProcessingHours: number = 24): Pro
   const cutoffDate = new Date();
   cutoffDate.setHours(cutoffDate.getHours() - maxProcessingHours);
 
-  console.log(`[Cleanup] Cleaning up episodes stuck in processing for more than ${maxProcessingHours} hours`);
-
   try {
     const { getDbPool } = await import('@/lib/db/client');
     const pool = getDbPool();
     const result = await pool.query(
-      `SELECT e.* FROM episodes e
-       LEFT JOIN processing_jobs pj ON e.id = pj.episode_id
-       WHERE e.state = 'processing' 
-       AND e.created_at < $1
-       AND (pj.status = 'failed' OR pj.status IS NULL OR pj.created_at < $1)`,
+      `UPDATE episodes e SET state = 'failed'
+       WHERE e.state = 'processing'
+         AND e.created_at < $1
+         AND NOT EXISTS (
+           SELECT 1 FROM processing_jobs pj
+           WHERE pj.episode_id = e.id AND pj.status IN ('pending', 'processing') AND pj.updated_at >= $1
+         )
+       RETURNING e.id`,
       [cutoffDate]
     );
-
-    for (const episode of result.rows) {
-      try {
-        await deleteEpisodeWithStorageCleanup(episode.id);
-        stats.episodesDeleted++;
-        console.log(`[Cleanup] Deleted stuck episode: ${episode.id}`);
-      } catch (error) {
-        console.error(`[Cleanup] Error deleting stuck episode ${episode.id}:`, error);
-        stats.errors++;
-      }
-    }
+    console.log(`[Cleanup] Marked ${result.rowCount ?? 0} stuck episode(s) as failed`);
   } catch (error) {
     console.error('[Cleanup] Error during stuck episode cleanup:', error);
     stats.errors++;
   }
 
   return stats;
+}
+
+/**
+ * Delete a session and everything it owns: its episode's exports and tracks plus any raw chunks.
+ */
+export async function deleteSessionWithStorageCleanup(sessionId: string): Promise<void> {
+  const { getEpisodeBySessionId } = await import('@/lib/db/queries/episodes');
+  const { deleteSession } = await import('@/lib/db/queries/sessions');
+  const episode = await getEpisodeBySessionId(sessionId);
+  if (episode) {
+    await deleteEpisodeWithStorageCleanup(episode.id);
+  } else {
+    const storage = getStorageProvider();
+    for (const chunk of await getAllSessionChunks(sessionId)) {
+      await storage.delete(chunk.storage_key);
+    }
+  }
+  await deleteSession(sessionId);
 }

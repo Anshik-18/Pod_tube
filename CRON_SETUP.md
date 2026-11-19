@@ -1,5 +1,11 @@
 # Quick Cron Job Setup Guide
 
+> **Authentication required:** `POST /api/cleanup` only runs when the request carries
+> `Authorization: Bearer <CRON_SECRET>` and the server has the same `CRON_SECRET` set.
+> Without `CRON_SECRET` the endpoint is disabled. Retention comes from the server's
+> `EPISODE_RETENTION_DAYS`; it can no longer be overridden in the request body.
+> Stuck episodes are now marked **failed** (retryable from the project page), not deleted.
+
 ## Quick Start
 
 ### 1. Test the cleanup script manually
@@ -85,17 +91,17 @@ In Coolify, you can set up a scheduled task that calls your cleanup endpoint:
 
 **Option 1: Use your domain (recommended for production):**
 ```bash
-curl -X POST https://yourdomain.com/api/cleanup -H "Content-Type: application/json" -d '{"retentionDays": 7, "cleanupStuck": true}'
+curl -X POST https://yourdomain.com/api/cleanup -H "Authorization: Bearer $CRON_SECRET" -H "Content-Type: application/json" -d '{"cleanupStuck": true}'
 ```
 
 **Option 2: Use internal container name (if task runs in same network):**
 ```bash
-curl -X POST http://your-app-name:3000/api/cleanup -H "Content-Type: application/json" -d '{"retentionDays": 7, "cleanupStuck": true}'
+curl -X POST http://your-app-name:3000/api/cleanup -H "Authorization: Bearer $CRON_SECRET" -H "Content-Type: application/json" -d '{"cleanupStuck": true}'
 ```
 
 **Option 3: Use localhost (only if task runs inside the app container):**
 ```bash
-curl -X POST http://localhost:3000/api/cleanup -H "Content-Type: application/json" -d '{"retentionDays": 7, "cleanupStuck": true}'
+curl -X POST http://localhost:3000/api/cleanup -H "Authorization: Bearer $CRON_SECRET" -H "Content-Type: application/json" -d '{"cleanupStuck": true}'
 ```
 
 **Note:** Replace `yourdomain.com` with your actual domain, or `your-app-name` with your Coolify app's container name.
@@ -110,8 +116,8 @@ curl http://localhost:3000/api/cleanup
 
 # Run cleanup manually
 curl -X POST http://localhost:3000/api/cleanup \
-  -H "Content-Type: application/json" \
-  -d '{"retentionDays": 7, "cleanupStuck": true}'
+  -H "Authorization: Bearer $CRON_SECRET" -H "Content-Type: application/json" \
+  -d '{"cleanupStuck": true}'
 ```
 
 ### Test cron script

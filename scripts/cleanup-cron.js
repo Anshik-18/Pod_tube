@@ -4,7 +4,7 @@
  * This script can be run manually or via cron to trigger cleanup
  * 
  * Usage:
- *   node scripts/cleanup-cron.js
+ *   CRON_SECRET=... node scripts/cleanup-cron.js
  * 
  * Or add to crontab:
  *   0 2 * * * cd /path/to/app && node scripts/cleanup-cron.js >> /var/log/cleanup.log 2>&1
@@ -16,6 +16,12 @@ const https = require('https');
 // Get configuration from environment
 // Default to localhost for development, but should be set to domain in production
 const cleanupUrl = process.env.CLEANUP_URL || 'http://localhost:3000/api/cleanup';
+const cronSecret = process.env.CRON_SECRET;
+
+if (!cronSecret) {
+  console.error('[Cleanup Cron] CRON_SECRET is not set. It must match the server's CRON_SECRET.');
+  process.exit(1);
+}
 const retentionDays = parseInt(process.env.EPISODE_RETENTION_DAYS || '7', 10);
 const maxProcessingHours = parseInt(process.env.MAX_PROCESSING_HOURS || '24', 10);
 
@@ -28,10 +34,7 @@ const url = new URL(cleanupUrl);
 
 async function runCleanup() {
   return new Promise((resolve, reject) => {
-    const postData = JSON.stringify({
-      retentionDays,
-      cleanupStuck: true,
-    });
+    const postData = JSON.stringify({ cleanupStuck: true });
 
     const options = {
       hostname: url.hostname,
@@ -41,6 +44,7 @@ async function runCleanup() {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(postData),
+        Authorization: `Bearer ${cronSecret}`,
       },
     };
 

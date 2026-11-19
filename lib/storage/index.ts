@@ -5,15 +5,20 @@ import { S3StorageProvider } from './s3';
 let storageProvider: StorageProvider | null = null;
 let lastStorageType: string | null = null;
 
+/** Local disk in production is only safe on one server with a persistent volume; it must be opted into. */
+export function localStorageAllowedInProduction(): boolean {
+  return process.env.ALLOW_LOCAL_STORAGE === 'true';
+}
+
 export function getStorageProvider(): StorageProvider {
   // Always normalize the storage type
   const rawStorageType = process.env.STORAGE_TYPE || 'local';
   const storageType = rawStorageType.toLowerCase();
   
   const isProduction = process.env.NODE_ENV === 'production';
-  if (isProduction && storageType !== 'r2' && storageType !== 's3') {
+  if (isProduction && storageType !== 'r2' && storageType !== 's3' && !localStorageAllowedInProduction()) {
     throw new Error(
-      `[Storage Error] INVALID CONFIGURATION FOR PRODUCTION: STORAGE_TYPE is set to "${rawStorageType}". Production deployments on ephemeral platforms like Railway require persistent cloud storage ("r2" or "s3"). Please set STORAGE_TYPE=r2 in your environment variables.`
+      `[Storage Error] INVALID CONFIGURATION FOR PRODUCTION: STORAGE_TYPE is set to "${rawStorageType}". Production deployments on ephemeral platforms like Railway require persistent cloud storage ("r2" or "s3"). Please set STORAGE_TYPE=r2 in your environment variables (or ALLOW_LOCAL_STORAGE=true on a single server with a persistent volume).`
     );
   }
 

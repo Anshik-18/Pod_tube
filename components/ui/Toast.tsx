@@ -1,6 +1,8 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
+import { CheckCircle2, AlertCircle, AlertTriangle, Info, X } from 'lucide-react';
+import { cn } from '@/lib/client/cn';
 
 export type ToastType = 'success' | 'error' | 'info' | 'warning';
 
@@ -17,55 +19,50 @@ interface ToastContextType {
 
 const ToastContext = React.createContext<ToastContextType | undefined>(undefined);
 
+const ICONS: Record<ToastType, React.ReactNode> = {
+  success: <CheckCircle2 className="h-4 w-4 text-emerald-400" />,
+  error: <AlertCircle className="h-4 w-4 text-red-400" />,
+  warning: <AlertTriangle className="h-4 w-4 text-amber-400" />,
+  info: <Info className="h-4 w-4 text-brand-light" />,
+};
+
 export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const counter = useRef(0);
 
-  const showToast = (message: string, type: ToastType = 'info', duration: number = 5000) => {
-    const id = Math.random().toString(36).substring(7);
-    const toast: Toast = { id, message, type, duration };
-    setToasts((prev) => [...prev, toast]);
-
-    if (duration > 0) {
-      setTimeout(() => {
-        removeToast(id);
-      }, duration);
-    }
-  };
-
-  const removeToast = (id: string) => {
+  const removeToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((toast) => toast.id !== id));
-  };
+  }, []);
+
+  // Stable identity: pages list showToast in effect dependencies.
+  const showToast = useCallback(
+    (message: string, type: ToastType = 'info', duration: number = 4000) => {
+      const id = `t${++counter.current}`;
+      setToasts((prev) => [...prev.slice(-3), { id, message, type, duration }]);
+      if (duration > 0) {
+        setTimeout(() => removeToast(id), duration);
+      }
+    },
+    [removeToast]
+  );
+
+  const value = useMemo(() => ({ showToast }), [showToast]);
 
   return (
-    <ToastContext.Provider value={{ showToast }}>
+    <ToastContext.Provider value={value}>
       {children}
-      <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-2.5">
+      <div className="pointer-events-none fixed bottom-4 right-4 z-[200] flex w-[calc(100%-2rem)] max-w-sm flex-col gap-2" aria-live="polite">
         {toasts.map((toast) => (
           <div
             key={toast.id}
-            className={`
-              px-4 py-3 rounded-2xl shadow-2xl min-w-[280px] max-w-md
-              flex items-center justify-between gap-3 backdrop-blur-xl border text-xs font-medium
-              animate-in fade-in slide-in-from-bottom-3 duration-200
-              ${
-                toast.type === 'success'
-                  ? 'bg-[#121215]/95 border-emerald-500/30 text-emerald-300'
-                  : toast.type === 'error'
-                  ? 'bg-[#121215]/95 border-red-500/30 text-red-300'
-                  : toast.type === 'warning'
-                  ? 'bg-[#121215]/95 border-amber-500/30 text-amber-300'
-                  : 'bg-[#121215]/95 border-[#6e56f8]/40 text-purple-200'
-              }
-            `}
+            className={cn(
+              'pointer-events-auto flex items-start gap-3 rounded-xl border border-line bg-surface-2/95 px-3.5 py-3 text-sm text-ink shadow-elevated backdrop-blur animate-slide-up'
+            )}
           >
-            <p className="flex-1 text-xs font-medium leading-relaxed">{toast.message}</p>
-            <button
-              onClick={() => removeToast(toast.id)}
-              className="text-zinc-500 hover:text-white transition-colors p-1"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
+            <span className="mt-0.5 shrink-0">{ICONS[toast.type]}</span>
+            <p className="flex-1 leading-snug">{toast.message}</p>
+            <button onClick={() => removeToast(toast.id)} className="shrink-0 rounded p-0.5 text-ink-faint hover:text-ink" aria-label="Dismiss">
+              <X className="h-3.5 w-3.5" />
             </button>
           </div>
         ))}
@@ -74,11 +71,8 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function useToast() {
-  const context = React.useContext(ToastContext);
-  if (context === undefined) {
-    throw new Error('useToast must be used within a ToastProvider');
-  }
-  return context;
-}
+const noopToast: ToastContextType = { showToast: () => {} };
 
+export function useToast() {
+  return React.useContext(ToastContext) ?? noopToast;
+}

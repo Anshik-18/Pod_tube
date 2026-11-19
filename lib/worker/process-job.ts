@@ -13,48 +13,66 @@ export interface ProcessJobPipelineResult {
   uploadResult: UploadStageResult;
 }
 
+/** Share of overall progress (0-100) allotted to each stage. */
+const STAGES = {
+  download: [0, 10],
+  concat: [10, 15],
+  merge: [15, 90],
+  upload: [90, 99],
+} as const;
+
+export type ProgressReporter = (percent: number) => void;
+
+function within(report: ProgressReporter | undefined, [from, to]: readonly [number, number]) {
+  return (fraction: number) => report?.(Math.round(from + (to - from) * fraction));
+}
+
 /**
  * processJob
  *
- * Executes the complete end-to-end background worker processing pipeline for a claimed ProcessingJob:
- * 1. Download Stage: Streams R2 WebM chunks to local working directory organized by participant.
- * 2. Concat Stage: Stream copy concatenates chunks per participant into continuous host.webm & guest.webm files.
- * 3. Timeline Stage: Resolves exact recording timeline timestamps and computes participantOffsetMs relative to timelineStart.
- * 4. Merge Stage: Merges host & guest tracks using FFmpeg side-by-side layout with timeline synchronization -> episode.mp4.
- * 5. Upload Stage: Uploads episode.mp4 to Cloudflare R2 and updates Episode & Session DB records to 'ready'.
- * 6. R2 Chunk Cleanup Stage: Deletes original recording chunk objects from Cloudflare R2 and removes recording_chunks DB records.
- * 7. Directory Cleanup Stage: Removes temporary working directory files ONLY after verified success.
+ * End-to-end pipeline for a claimed ProcessingJob:
+ * 1. Download: fetch chunks (fresh recording) or saved tracks (re-export) to a temp directory.
+ * 2. Concat: byte-join chunks per participant and remux into seekable WebM tracks.
+ * 3. Timeline: compute each participant's start offset for synchronization.
+ * 4. Merge: composite, mix, trim and encode episode.mp4 using the episode's export settings.
+ * 5. Upload: save MP4, MP3, thumbnail and per-participant tracks; mark the episode ready.
+ * 6. Chunk cleanup: once tracks are persisted, delete the raw chunks.
+ * 7. Always remove the temp directory.
  */
-export async function processJob(job: ProcessingJob): Promise<ProcessJobPipelineResult> {
-  console.log(`[Worker:processJob] Starting end-to-end processing pipeline for job ${job.id} (episode: ${job.episode_id})`);
+export async function processJob(job: ProcessingJob, onProgress?: ProgressReporter): Promise<ProcessJobPipelineResult> {
+  console.log(`[Worker:processJob] Starting pipeline for job ${job.id} (episode: ${job.episode_id})`);
 
-  // Step 1: Execute chunk download stage
-  const downloadResult = await downloadChunksStage(job);
+  const downloadResult = await downloadChunksStage(job, within(onProgress, STAGES.download));
+  try {
+    const concatResult = await concatStage(downloadResult);
+    within(onProgress, STAGES.concat)(1);
 
-  // Step 2: Execute FFmpeg concat stage (per-participant stream copy)
-  const concatResult = await concatStage(downloadResult);
+    const timeline = await resolveSessionTimeline(downloadResult.sessionId);
+    const mergeResult = await mergeStage(
+      concatResult,
+      timeline,
+      downloadResult.episode.trim_settings,
+      within(onProgress, STAGES.merge)
+    );
 
-  // Step 3: Resolve participant timeline & compute synchronization offsets
-  const timeline = await resolveSessionTimeline(downloadResult.sessionId);
+    const uploadResult = await uploadStage(
+      downloadResult.episode,
+      concatResult,
+      mergeResult,
+      within(onProgress, STAGES.upload),
+      downloadResult.unusable
+    );
 
-  // Step 4: Execute timeline-aware participant merge stage (side-by-side -> episode.mp4)
-  const mergeResult = await mergeStage(concatResult, timeline);
+    const assembledFromChunks = Object.values(concatResult.participants).filter((p) => p?.isNewTrack).length;
+    if (assembledFromChunks > 0 && uploadResult.persistedTracks.length === assembledFromChunks) {
+      await cleanupR2ChunksStage(downloadResult.sessionId).catch((err) =>
+        console.warn(`[Worker:processJob] Chunk cleanup failed (will not affect the episode):`, err.message)
+      );
+    }
 
-  // Step 5: Upload final episode.mp4 to Cloudflare R2 & update DB records
-  const uploadResult = await uploadStage(job.episode_id, downloadResult.sessionId, mergeResult);
-
-  // Step 6: Delete original WebM chunk objects from Cloudflare R2 and remove recording_chunks database records
-  await cleanupR2ChunksStage(downloadResult.sessionId);
-
-  // Step 7: Cleanup temporary working directory ONLY after successful upload, DB updates, and R2 chunk cleanup
-  await cleanupStage(downloadResult.workingDirectory);
-
-  console.log(`[Worker:processJob] Pipeline completed successfully for job ${job.id}. Storage Key: ${uploadResult.storageKey}`);
-
-  return {
-    concatResult,
-    timeline,
-    mergeResult,
-    uploadResult,
-  };
+    console.log(`[Worker:processJob] Pipeline completed for job ${job.id}`);
+    return { concatResult, timeline, mergeResult, uploadResult };
+  } finally {
+    await cleanupStage(downloadResult.workingDirectory);
+  }
 }

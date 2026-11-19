@@ -1,197 +1,116 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { ConcatStageResult } from './concat-chunks';
 import { SessionTimeline } from './timeline';
+import { runFFmpeg, probeMedia, getVideoEncoder } from './ffmpeg';
+import { buildRenderPlan, SceneInput } from './scenes';
+import type { TrimSettings } from '../db/queries/episodes';
+import { baseParticipant, isScreenTrack } from '../participants';
 
-const execAsync = promisify(exec);
+export { gridLayout, screenLayout, QUALITY_PRESETS, planScenes, buildRenderPlan } from './scenes';
+export type { SceneInput as MergeInput, Rect, Scene } from './scenes';
 
 export interface MergeStageResult {
   outputFile: string;
   durationMs: number;
+  /** Length of the full synchronized timeline before trimming. */
+  sourceDurationMs: number;
   width: number;
   height: number;
   fileSizeBytes: number;
-}
-
-function getFFmpegBin(): string {
-  return process.env.FFMPEG_PATH ? `"${process.env.FFMPEG_PATH}"` : 'ffmpeg';
-}
-
-function getFFprobeBin(): string {
-  if (process.env.FFPROBE_PATH) {
-    return `"${process.env.FFPROBE_PATH}"`;
-  }
-  if (process.env.FFMPEG_PATH) {
-    return `"${process.env.FFMPEG_PATH.replace(/ffmpeg\.exe$/i, 'ffprobe.exe')}"`;
-  }
-  return 'ffprobe';
+  /** How many layout scenes the episode was rendered in. */
+  sceneCount: number;
 }
 
 /**
- * Extract video dimensions and duration using ffprobe
+ * Place every track on the shared timeline, ordered host first and then by when each person
+ * started recording (that's their tile order).
  */
-async function probeMedia(filePath: string): Promise<{ width: number; height: number; durationMs: number; fileSizeBytes: number }> {
-  const stat = await fs.stat(filePath);
-  const normalizedPath = filePath.replace(/\\/g, '/');
-  const ffprobeBin = getFFprobeBin();
-
-  try {
-    const { stdout } = await execAsync(
-      `${ffprobeBin} -v error -select_streams v:0 -show_entries stream=width,height,duration -show_entries format=duration -of json "${normalizedPath}"`
-    );
-    const info = JSON.parse(stdout);
-    const videoStream = info.streams?.[0];
-    const durationSec = parseFloat(info.format?.duration || videoStream?.duration || '0');
-
-    return {
-      width: videoStream?.width || 1280,
-      height: videoStream?.height || 720,
-      durationMs: Math.round(durationSec * 1000),
-      fileSizeBytes: stat.size,
-    };
-  } catch (err) {
-    console.warn(`[MergeStage] ffprobe execution fallback for ${filePath}:`, err);
-    return {
-      width: 1280,
-      height: 720,
-      durationMs: 0,
-      fileSizeBytes: stat.size,
-    };
+export function timelineInputs(concatResult: ConcatStageResult, timeline: SessionTimeline): SceneInput[] {
+  const inputs: SceneInput[] = [];
+  for (const [participantType, track] of Object.entries(concatResult.participants)) {
+    const t = timeline.participants[participantType];
+    inputs.push({
+      participantType,
+      file: track.outputFile,
+      offsetSec: (t?.offsetMs ?? 0) / 1000,
+      durationSec: track.media.durationSec ?? (t ? t.durationMs / 1000 : 0),
+      hasVideo: track.media.hasVideo,
+      hasAudio: track.media.hasAudio,
+      isScreen: isScreenTrack(participantType),
+      group: baseParticipant(participantType),
+    });
   }
+
+  const firstSeen = new Map<string, number>();
+  for (const i of inputs) firstSeen.set(i.group!, Math.min(firstSeen.get(i.group!) ?? Infinity, i.offsetSec));
+  const rank = (i: SceneInput) => (i.group === 'host' ? -1 : firstSeen.get(i.group!)!);
+  inputs.sort((a, b) => rank(a) - rank(b) || (a.group! < b.group! ? -1 : a.group! > b.group! ? 1 : a.offsetSec - b.offsetSec));
+
+  // Offsets are relative to the earliest track; re-base on the tracks we actually have.
+  const minOffset = Math.min(...inputs.map((i) => i.offsetSec));
+  inputs.forEach((i) => (i.offsetSec -= minOffset));
+  return inputs;
 }
 
 /**
  * mergeStage
  *
- * Merges participant recordings into a synchronized episode.mp4 using FFmpeg.
- * - Single Participant: Transcodes WebM to MP4 with H.264/AAC/yuv420p.
- * - Dual Participant (Host + Guest): Side-by-side hstack layout with timeline synchronization.
- *   - Video delay applied via tpad (start_duration) / setpts.
- *   - Audio delay applied via adelay filter (initial silence).
- *   - Audio tracks mixed using amix (duration=longest).
+ * Renders episode.mp4: one video pass per layout scene, one audio mix, then a stream-copy
+ * concat + mux. Memory stays flat regardless of length or how often people come and go.
  */
 export async function mergeStage(
   concatResult: ConcatStageResult,
-  timeline: SessionTimeline
+  timeline: SessionTimeline,
+  trim: TrimSettings | null,
+  onProgress?: (fraction: number) => void
 ): Promise<MergeStageResult> {
   const { workingDirectory, jobId } = concatResult;
-  const hostData = concatResult.participants.host;
-  const guestData = concatResult.participants.guest;
-
-  const hostTimeline = timeline.participants.host;
-  const guestTimeline = timeline.participants.guest;
-
+  const workDir = path.join(workingDirectory, 'render');
+  await fs.mkdir(workDir, { recursive: true });
   const outputFile = path.join(workingDirectory, 'episode.mp4');
-  const normalizedOutputFile = outputFile.replace(/\\/g, '/');
-  const ffmpegBin = getFFmpegBin();
 
-  console.log(`[MergeStage] Starting participant merge stage for job ${jobId}`);
+  const inputs = timelineInputs(concatResult, timeline);
+  const firstCamera = inputs.find((i) => !i.isScreen);
+  const sourceHeight = firstCamera ? concatResult.participants[firstCamera.participantType]?.media.height ?? null : null;
+  const plan = buildRenderPlan(inputs, { workDir, outputFile, trim, sourceHeight, videoEncoder: await getVideoEncoder() });
 
-  // Case 1: Single Participant (Host only or Guest only)
-  if (!hostData || !guestData) {
-    const singleData = hostData || guestData;
-    const singleTimeline = hostTimeline || guestTimeline;
+  console.log(
+    `[MergeStage] Job ${jobId}: ${plan.width}x${plan.height}, ${plan.outputDurationSec.toFixed(1)}s in ${plan.scenes.length} scene(s): ` +
+      plan.scenes.map((s) => `${s.start.toFixed(1)}–${s.end.toFixed(1)}s [${s.slots.join(', ')}${s.screen ? ' + screen' : ''}]`).join('; ')
+  );
 
-    if (!singleData) {
-      throw new Error(`[MergeStage] No participant audio/video output files found for job ${jobId}`);
-    }
-
-    const inputPath = singleData.outputFile.replace(/\\/g, '/');
-    const offsetMs = singleTimeline?.offsetMs || 0;
-    const offsetSec = (offsetMs / 1000).toFixed(3);
-
-    let command: string;
-
-    if (offsetMs > 0) {
-      // Single participant with start delay offset
-      const filterGraph = `[0:v]tpad=start_duration=${offsetSec}:start_mode=add,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[v];[0:a]adelay=${offsetMs}|${offsetMs},aformat=sample_rates=44100:channel_layouts=stereo[a]`;
-      command = `${ffmpegBin} -y -i "${inputPath}" -filter_complex "${filterGraph}" -map "[v]" -map "[a]" -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${normalizedOutputFile}"`;
-    } else {
-      // Direct transcode single participant
-      command = `${ffmpegBin} -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${normalizedOutputFile}"`;
-    }
-
-    console.log(`[MergeStage] Executing single-participant FFmpeg command: ${command}`);
-
-    try {
-      const { stdout } = await execAsync(command, { maxBuffer: 10 * 1024 * 1024 });
-      if (stdout) console.log(`[MergeStage] FFmpeg stdout:`, stdout.trim());
-    } catch (error: any) {
-      console.error(`[MergeStage] FFmpeg single-participant merge failed:`, error?.stderr || error?.message);
-      throw new Error(`FFmpeg merge failed for ${outputFile}: ${error?.message || error}`);
-    }
-
-    const metadata = await probeMedia(outputFile);
-    console.log(`[MergeStage] Single participant merge completed -> ${outputFile} (${(metadata.fileSizeBytes / (1024 * 1024)).toFixed(2)} MB, ${metadata.durationMs}ms)`);
-    return {
-      outputFile,
-      ...metadata,
-    };
+  // Progress: video passes ~85%, audio ~10%, mux ~5%.
+  const videoTotal = plan.scenes.reduce((n, s) => n + s.pass.durationSec, 0) || 1;
+  let videoDone = 0;
+  for (const scene of plan.scenes) {
+    const base = videoDone;
+    await runFFmpeg(scene.pass.args, {
+      durationSec: scene.pass.durationSec,
+      label: `scene ${scene.start.toFixed(1)}s`,
+      onProgress: (f) => onProgress?.(0.85 * ((base + f * scene.pass.durationSec) / videoTotal)),
+    });
+    videoDone += scene.pass.durationSec;
   }
+  await runFFmpeg(plan.audio.args, {
+    durationSec: plan.audio.durationSec,
+    label: 'audio mix',
+    onProgress: (f) => onProgress?.(0.85 + 0.1 * f),
+  });
+  await fs.writeFile(path.join(workDir, 'scenes.txt'), plan.concatList);
+  await runFFmpeg(plan.mux.args, { durationSec: plan.mux.durationSec, label: 'mux', onProgress: (f) => onProgress?.(0.95 + 0.05 * f) });
+  await fs.rm(workDir, { recursive: true, force: true });
 
-  // Case 2: Dual Participant (Host + Guest) - Side-by-Side Sync Layout
-  const hostInputPath = hostData.outputFile.replace(/\\/g, '/');
-  const guestInputPath = guestData.outputFile.replace(/\\/g, '/');
-
-  const hostOffsetMs = hostTimeline?.offsetMs || 0;
-  const guestOffsetMs = guestTimeline?.offsetMs || 0;
-
-  const hostOffsetSec = (hostOffsetMs / 1000).toFixed(3);
-  const guestOffsetSec = (guestOffsetMs / 1000).toFixed(3);
-
-  // Build Host Video & Audio Filters
-  let hostVideoFilter = `scale=640:720:force_original_aspect_ratio=decrease,pad=640:720:(ow-iw)/2:(oh-ih)/2,setsar=1`;
-  if (hostOffsetMs > 0) {
-    hostVideoFilter = `tpad=start_duration=${hostOffsetSec}:start_mode=add,` + hostVideoFilter;
-  }
-
-  let hostAudioFilter = `aformat=sample_rates=44100:channel_layouts=stereo`;
-  if (hostOffsetMs > 0) {
-    hostAudioFilter = `adelay=${hostOffsetMs}|${hostOffsetMs},` + hostAudioFilter;
-  }
-
-  // Build Guest Video & Audio Filters
-  let guestVideoFilter = `scale=640:720:force_original_aspect_ratio=decrease,pad=640:720:(ow-iw)/2:(oh-ih)/2,setsar=1`;
-  if (guestOffsetMs > 0) {
-    guestVideoFilter = `tpad=start_duration=${guestOffsetSec}:start_mode=add,` + guestVideoFilter;
-  }
-
-  let guestAudioFilter = `aformat=sample_rates=44100:channel_layouts=stereo`;
-  if (guestOffsetMs > 0) {
-    guestAudioFilter = `adelay=${guestOffsetMs}|${guestOffsetMs},` + guestAudioFilter;
-  }
-
-  // Combine into FFmpeg Filter Graph
-  const filterGraph = [
-    `[0:v]${hostVideoFilter}[v0]`,
-    `[0:a]${hostAudioFilter}[a0]`,
-    `[1:v]${guestVideoFilter}[v1]`,
-    `[1:a]${guestAudioFilter}[a1]`,
-    `[v0][v1]hstack=inputs=2[v]`,
-    `[a0][a1]amix=inputs=2:duration=longest:dropout_transition=2[a]`,
-  ].join(';');
-
-  const command = `${ffmpegBin} -y -i "${hostInputPath}" -i "${guestInputPath}" -filter_complex "${filterGraph}" -map "[v]" -map "[a]" -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${normalizedOutputFile}"`;
-
-  console.log(`[MergeStage] Executing dual-participant synchronized merge:`);
-  console.log(`[MergeStage]   Host offset: ${hostOffsetMs}ms, Guest offset: ${guestOffsetMs}ms`);
-  console.log(`[MergeStage]   Command: ${command}`);
-
-  try {
-    const { stdout } = await execAsync(command, { maxBuffer: 10 * 1024 * 1024 });
-    if (stdout) console.log(`[MergeStage] FFmpeg stdout:`, stdout.trim());
-  } catch (error: any) {
-    console.error(`[MergeStage] FFmpeg dual-participant merge failed:`, error?.stderr || error?.message);
-    throw new Error(`FFmpeg merge failed for ${outputFile}: ${error?.message || error}`);
-  }
-
-  const metadata = await probeMedia(outputFile);
-  console.log(`[MergeStage] Dual-participant merge complete -> ${outputFile} (${metadata.width}x${metadata.height}, ${(metadata.fileSizeBytes / (1024 * 1024)).toFixed(2)} MB, ${metadata.durationMs}ms)`);
+  const stat = await fs.stat(outputFile);
+  const probed = await probeMedia(outputFile).catch(() => null);
 
   return {
     outputFile,
-    ...metadata,
+    durationMs: Math.round((probed?.durationSec ?? plan.outputDurationSec) * 1000),
+    sourceDurationMs: Math.round(plan.timelineDurationSec * 1000),
+    width: probed?.width ?? plan.width,
+    height: probed?.height ?? plan.height,
+    fileSizeBytes: stat.size,
+    sceneCount: plan.scenes.length,
   };
 }

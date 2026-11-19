@@ -1,82 +1,81 @@
 'use client';
 
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
+import { api, getAuthToken, setAuthToken } from '@/lib/client/api';
 
-interface User {
+export interface User {
   id: string;
   email: string;
-  name?: string;
+  name?: string | null;
 }
 
 interface AuthContextType {
   user: User | null;
   loading: boolean;
-  login: (token: string) => void;
+  login: (token: string, user?: User) => void;
   logout: () => void;
+  setUser: (user: User) => void;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUserState] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const router = useRouter();
 
-  useEffect(() => {
-    checkAuth();
-  }, []);
-
-  const checkAuth = async () => {
-    const token = localStorage.getItem('token');
-    if (!token) {
+  const checkAuth = useCallback(async () => {
+    if (!getAuthToken()) {
       setLoading(false);
       return;
     }
-
     try {
-      const response = await fetch('/api/auth/me', {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        setUser(data.user);
-      } else {
-        localStorage.removeItem('token');
-      }
-    } catch (error) {
-      console.error('Auth check error:', error);
-      localStorage.removeItem('token');
+      const data = await api<{ user: User }>('/api/auth/me');
+      setUserState(data.user);
+    } catch {
+      setAuthToken(null);
+      setUserState(null);
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const login = (token: string) => {
-    localStorage.setItem('token', token);
+  useEffect(() => {
     checkAuth();
-  };
+  }, [checkAuth]);
 
-  const logout = () => {
-    localStorage.removeItem('token');
-    setUser(null);
-    router.push('/login');
-  };
-
-  return (
-    <AuthContext.Provider value={{ user, loading, login, logout }}>
-      {children}
-    </AuthContext.Provider>
+  const login = useCallback(
+    (token: string, nextUser?: User) => {
+      setAuthToken(token);
+      if (nextUser) {
+        setUserState(nextUser);
+        setLoading(false);
+      } else {
+        checkAuth();
+      }
+    },
+    [checkAuth]
   );
+
+  const logout = useCallback(() => {
+    setAuthToken(null);
+    setUserState(null);
+    fetch('/api/auth/logout', { method: 'POST' }).finally(() => router.push('/login'));
+  }, [router]);
+
+  const value = useMemo(
+    () => ({ user, loading, login, logout, setUser: setUserState }),
+    [user, loading, login, logout]
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
-export function useAuth() {
+export function useAuth(): AuthContextType {
   const context = useContext(AuthContext);
   if (context === undefined) {
-    return { user: null, loading: false, login: () => {}, logout: () => {} };
+    return { user: null, loading: false, login: () => {}, logout: () => {}, setUser: () => {} };
   }
   return context;
 }

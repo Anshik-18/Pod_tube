@@ -1,0 +1,7 @@
+# Keep line endings consistent across Windows and Linux checkouts.
+* text=auto eol=lf
+*.pdf binary
+*.png binary
+*.jpg binary
+*.webm binary
+*.mp4 binary

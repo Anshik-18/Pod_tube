@@ -65,6 +65,41 @@ export async function createProcessingJobIfAbsent(episodeId: string): Promise<Pr
   }
 }
 
+/**
+ * Queue a (re-)processing run. Unlike createProcessingJobIfAbsent this ignores completed
+ * jobs, so a ready episode can be re-exported, but it never stacks a second active job.
+ */
+export async function enqueueProcessingJob(episodeId: string): Promise<ProcessingJob> {
+  const pool = getDbPool();
+  const active = await pool.query<ProcessingJob>(
+    `SELECT * FROM processing_jobs
+     WHERE episode_id = $1 AND status IN ('pending', 'processing')
+     ORDER BY created_at DESC LIMIT 1`,
+    [episodeId]
+  );
+  if (active.rows.length > 0) {
+    return active.rows[0];
+  }
+  const result = await pool.query<ProcessingJob>(
+    `INSERT INTO processing_jobs (episode_id, status, progress) VALUES ($1, 'pending', 0) RETURNING *`,
+    [episodeId]
+  );
+  return result.rows[0];
+}
+
+/**
+ * Return jobs whose worker died mid-run (no progress heartbeat for `staleMinutes`) to the queue.
+ */
+export async function requeueStaleProcessingJobs(staleMinutes = 15): Promise<number> {
+  const pool = getDbPool();
+  const result = await pool.query(
+    `UPDATE processing_jobs SET status = 'pending', updated_at = NOW()
+     WHERE status = 'processing' AND updated_at < NOW() - ($1 || ' minutes')::interval`,
+    [String(staleMinutes)]
+  );
+  return result.rowCount || 0;
+}
+
 export async function getProcessingJobById(id: string): Promise<ProcessingJob | null> {
   const pool = getDbPool();
   const result = await pool.query<ProcessingJob>(

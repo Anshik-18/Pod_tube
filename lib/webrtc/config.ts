@@ -16,7 +16,6 @@ export function getWebRTCConfig(): WebRTCConfig {
 
   if (turnServerUrl && turnUsername && turnPassword) {
     const cleanUrl = turnServerUrl.replace(/^(turn|turns):/i, '').split('?')[0];
-    console.log('[WebRTC] Using custom TURN server:', cleanUrl);
     iceServers.push({
       urls: [
         `turn:${cleanUrl}`,
@@ -28,7 +27,6 @@ export function getWebRTCConfig(): WebRTCConfig {
       credential: turnPassword,
     });
   } else {
-    console.log('[WebRTC] Using Metered Open Relay TURN fallback');
     iceServers.push(
       {
         urls: [
@@ -47,12 +45,14 @@ export function getWebRTCConfig(): WebRTCConfig {
   return { iceServers };
 }
 
-export async function fetchWebRTCConfig(): Promise<WebRTCConfig> {
+export async function fetchWebRTCConfig(authToken?: string): Promise<WebRTCConfig> {
   try {
-    const res = await fetch('/api/webrtc/config');
+    const res = await fetch('/api/webrtc/config', {
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+      cache: 'no-store',
+    });
     if (res.ok) {
       const data = await res.json();
-      console.log('[WebRTC] fetchWebRTCConfig response:', data);
       if (data.iceServers && Array.isArray(data.iceServers)) {
         const hasTurn = data.iceServers.some((s: RTCIceServer) => {
           const urls = Array.isArray(s.urls) ? s.urls : [s.urls];

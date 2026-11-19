@@ -4,6 +4,15 @@ This guide explains each environment variable and how to set them up.
 
 ## Required Variables
 
+### CRON_SECRET (Required for scheduled cleanup)
+
+Shared secret for `POST /api/cleanup`. Callers must send `Authorization: Bearer <CRON_SECRET>`;
+when it is unset, the cleanup endpoint is disabled. Generate one with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
 ### 1. JWT_SECRET (Required)
 **What it is:** A secret key used to sign and verify authentication tokens (JWTs).
 
@@ -136,6 +145,29 @@ MAX_PROCESSING_HOURS=24
 - Helps prevent storage buildup from failed processing jobs
 
 ---
+
+### 5. TURN via Cloudflare (Recommended)
+
+**CLOUDFLARE_TURN_KEY_ID** and **CLOUDFLARE_TURN_KEY_API_TOKEN** — from Cloudflare dashboard → Calls →
+TURN Server. When both are set, the app issues short-lived TURN credentials from Cloudflare and ignores
+`TURN_SERVER_*`. Without them it uses `TURN_SERVER_*`, then a public fallback.
+
+**ALLOW_LOCAL_STORAGE** — `true` permits `STORAGE_TYPE=local` in production (single server with a
+persistent volume for `/app/uploads`). Otherwise production requires `r2`/`s3` and refuses to start.
+
+### 6. Processing Variables (Optional)
+
+**PROCESSING_WORK_DIR** — where the worker assembles and encodes recordings. Needs roughly 1.5–3× the
+recording's size free (a 1-hour, 3-person 1080p session is ~8 GB of chunks). Default: the OS temp
+directory, or `./.processing` when the temp directory is RAM-backed (tmpfs), so long recordings don't
+consume memory. In Docker, point it at a mounted volume:
+
+```bash
+PROCESSING_WORK_DIR=/data/processing
+```
+
+FFmpeg needs an H.264 encoder: `libx264` (Docker/Alpine, Ubuntu) or `libopenh264` (Fedora's `ffmpeg-free`);
+the worker picks whichever is available.
 
 ## Complete .env Example
 

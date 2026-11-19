@@ -35,15 +35,29 @@ export function getDbPool(): Pool {
       };
     }
 
-    // Configure SSL based on DB_SSL_MODE or default behavior
-    const sslMode = process.env.DB_SSL_MODE?.toLowerCase();
-    if (sslMode === 'require' || sslMode === 'prefer') {
+    // SSL follows the standard `sslmode` in DATABASE_URL (or DB_SSL_MODE, which wins):
+    //   require / prefer / no-verify  -> encrypted, certificate not verified (Neon, most hosts)
+    //   verify-full / verify-ca       -> encrypted and verified
+    //   disable / not set             -> plain (a database on the same private network, e.g. Coolify)
+    let sslMode = process.env.DB_SSL_MODE?.toLowerCase();
+    if (config.connectionString) {
+      try {
+        const url = new URL(config.connectionString);
+        sslMode = sslMode ?? url.searchParams.get('sslmode')?.toLowerCase() ?? undefined;
+        // pg would otherwise re-parse sslmode itself and override the choice below.
+        url.searchParams.delete('sslmode');
+        url.searchParams.delete('sslrootcert');
+        config.connectionString = url.toString();
+      } catch {
+        // Not a URL (e.g. key=value form): leave it to pg.
+      }
+    }
+    if (sslMode === 'verify-full' || sslMode === 'verify-ca') {
+      config.ssl = { rejectUnauthorized: true };
+    } else if (sslMode === 'require' || sslMode === 'prefer' || sslMode === 'no-verify') {
       config.ssl = { rejectUnauthorized: false };
-    } else if (sslMode === 'disable') {
-      config.ssl = false;
     } else {
-      // Default: SSL in production, no SSL in development
-      config.ssl = process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false;
+      config.ssl = false;
     }
 
     // Set pool size if specified

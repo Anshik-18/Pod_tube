@@ -2,7 +2,7 @@ import { getDbPool } from '../client';
 
 export type UploadStatus = 'pending' | 'uploading' | 'completed' | 'failed';
 
-export type ParticipantType = 'host' | 'guest';
+export type ParticipantType = string;
 
 export interface Upload {
   id: string;
@@ -19,29 +19,11 @@ export interface Upload {
   updated_at: Date;
 }
 
-/**
- * Ensure uploads table contains timeline columns
- */
-async function ensureUploadColumns(): Promise<void> {
-  try {
-    const pool = getDbPool();
-    await pool.query(`
-      ALTER TABLE uploads ADD COLUMN IF NOT EXISTS total_chunks INTEGER;
-      ALTER TABLE uploads ADD COLUMN IF NOT EXISTS recording_duration INTEGER;
-      ALTER TABLE uploads ADD COLUMN IF NOT EXISTS recording_started_at TIMESTAMP WITH TIME ZONE;
-      ALTER TABLE uploads ADD COLUMN IF NOT EXISTS recording_ended_at TIMESTAMP WITH TIME ZONE;
-    `);
-  } catch (err) {
-    // Non-critical if columns exist
-  }
-}
-
 export async function createUpload(
   sessionId: string,
   participantType: ParticipantType,
   fileReference: string
 ): Promise<Upload> {
-  await ensureUploadColumns();
   const pool = getDbPool();
   const result = await pool.query<Upload>(
     'INSERT INTO uploads (session_id, participant_type, file_reference, status) VALUES ($1, $2, $3, $4) RETURNING *',
@@ -51,7 +33,6 @@ export async function createUpload(
 }
 
 export async function getUploadById(id: string): Promise<Upload | null> {
-  await ensureUploadColumns();
   const pool = getDbPool();
   const result = await pool.query<Upload>(
     'SELECT * FROM uploads WHERE id = $1',
@@ -65,7 +46,6 @@ export async function updateUploadStatus(
   status: UploadStatus,
   progress?: number
 ): Promise<Upload> {
-  await ensureUploadColumns();
   const pool = getDbPool();
   let query: string;
   let params: any[];
@@ -83,13 +63,30 @@ export async function updateUploadStatus(
 }
 
 export async function getUploadsBySessionId(sessionId: string): Promise<Upload[]> {
-  await ensureUploadColumns();
   const pool = getDbPool();
   const result = await pool.query<Upload>(
     'SELECT * FROM uploads WHERE session_id = $1 ORDER BY created_at',
     [sessionId]
   );
   return result.rows;
+}
+
+/**
+ * Register that a participant has started recording, so finalize waits for their track
+ * even if none of their chunks has reached the server yet.
+ */
+export async function registerRecordingParticipant(
+  sessionId: string,
+  participantType: ParticipantType,
+  recordingStartedAt: Date
+): Promise<void> {
+  const pool = getDbPool();
+  await pool.query(
+    `INSERT INTO uploads (session_id, participant_type, file_reference, status, recording_started_at)
+     SELECT $1::uuid, $2::varchar, $3::varchar, 'uploading', $4::timestamptz
+     WHERE NOT EXISTS (SELECT 1 FROM uploads WHERE session_id = $1::uuid AND participant_type = $2::varchar)`,
+    [sessionId, participantType, `sessions/${sessionId}/${participantType}/recording.webm`, recordingStartedAt]
+  );
 }
 
 /**
@@ -104,7 +101,6 @@ export async function recordParticipantTimeline(
   recordingStartedAt?: Date | string,
   recordingEndedAt?: Date | string
 ): Promise<Upload> {
-  await ensureUploadColumns();
   const pool = getDbPool();
   const fileRef = `sessions/${sessionId}/${participantType}/recording.webm`;
   const startDate = recordingStartedAt ? new Date(recordingStartedAt) : null;
@@ -136,4 +132,43 @@ export async function recordParticipantTimeline(
     );
     return created.rows[0];
   }
+}
+
+/** Forget a registered track that ended up with no media (e.g. a screen share stopped instantly). */
+export async function discardEmptyTrack(sessionId: string, participantType: ParticipantType): Promise<void> {
+  const pool = getDbPool();
+  await pool.query(
+    `DELETE FROM uploads u WHERE u.session_id = $1 AND u.participant_type = $2
+       AND NOT EXISTS (SELECT 1 FROM recording_chunks c WHERE c.session_id = $1 AND c.participant_type = $2)`,
+    [sessionId, participantType]
+  );
+}
+
+/**
+ * A participant rejoined mid-recording, so the browser that recorded their earlier tracks is gone
+ * and those tracks can never finalize. Keep what reached the server (marking it complete) and
+ * drop tracks that never uploaded anything, so processing doesn't wait for them forever.
+ */
+export async function settleAbandonedTracks(sessionId: string, participantId: string, keepOpen: string[] = []): Promise<string[]> {
+  const pool = getDbPool();
+  const like = `${participantId}.%`;
+  // Tracks the rejoining browser still holds locally and will finish uploading itself.
+  const keep = keepOpen.length ? keepOpen : [''];
+  const dropped = await pool.query<{ participant_type: string }>(
+    `DELETE FROM uploads u
+      WHERE u.session_id = $1 AND (u.participant_type = $2 OR u.participant_type LIKE $3) AND u.status <> 'completed'
+        AND u.participant_type <> ALL($4::varchar[])
+        AND NOT EXISTS (SELECT 1 FROM recording_chunks c
+                         WHERE c.session_id = u.session_id AND c.participant_type = u.participant_type AND c.status = 'completed')
+      RETURNING participant_type`,
+    [sessionId, participantId, like, keep]
+  );
+  const kept = await pool.query<{ participant_type: string }>(
+    `UPDATE uploads SET status = 'completed', recording_ended_at = COALESCE(recording_ended_at, NOW()), updated_at = NOW()
+      WHERE session_id = $1 AND (participant_type = $2 OR participant_type LIKE $3) AND status <> 'completed'
+        AND participant_type <> ALL($4::varchar[])
+      RETURNING participant_type`,
+    [sessionId, participantId, like, keep]
+  );
+  return [...dropped.rows, ...kept.rows].map((r) => r.participant_type);
 }

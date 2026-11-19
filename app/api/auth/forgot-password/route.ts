@@ -1,55 +1,50 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { getUserByEmail, setPasswordResetToken } from '@/lib/db/queries/users';
 import crypto from 'crypto';
+import { getUserByEmail, setPasswordResetToken } from '@/lib/db/queries/users';
+import { clientIp, rateLimit } from '@/lib/auth/rate-limit';
 
 const forgotPasswordSchema = z.object({
-  email: z.string().email(),
+  email: z.string().trim().email(),
 });
+
+const GENERIC_MESSAGE = 'If an account with that email exists, a password reset link has been sent.';
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await forgotPasswordSchema.parse(await req.json());
-    const { email } = body;
-
-    // Check if user exists
-    const user = await getUserByEmail(email);
-    if (!user) {
-      // Don't reveal if user exists for security
-      return NextResponse.json({ 
-        success: true, 
-        message: 'If an account with that email exists, a password reset link has been sent.' 
-      });
+    const limit = rateLimit(`forgot:${clientIp(req)}`, 5, 15 * 60_000);
+    if (!limit.ok) {
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
 
-    // Generate reset token
+    const { email } = forgotPasswordSchema.parse(await req.json());
+
+    const user = await getUserByEmail(email);
+    if (!user) {
+      // Same response either way so account existence isn't revealed
+      return NextResponse.json({ success: true, message: GENERIC_MESSAGE });
+    }
+
     const resetToken = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date();
-    expiresAt.setHours(expiresAt.getHours() + 1); // Token expires in 1 hour
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+    await setPasswordResetToken(user.email, resetToken, expiresAt);
 
-    // Save token to database
-    await setPasswordResetToken(email, resetToken, expiresAt);
-
-    // In a real app, you would send an email here with the reset link
-    // For now, we'll return the token in development (remove in production!)
+    // No email provider is configured: the link is logged server-side and, in development only, returned.
     const resetLink = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/reset-password?token=${resetToken}`;
-    
-    console.log('Password reset link (DEV ONLY):', resetLink);
-    
-    return NextResponse.json({ 
-      success: true, 
-      message: 'If an account with that email exists, a password reset link has been sent.',
-      // Remove this in production - only for development
-      ...(process.env.NODE_ENV === 'development' && { resetLink })
+    if (process.env.NODE_ENV === 'development') {
+      console.log('Password reset link (DEV ONLY):', resetLink);
+    }
+
+    return NextResponse.json({
+      success: true,
+      message: GENERIC_MESSAGE,
+      ...(process.env.NODE_ENV === 'development' && { resetLink }),
     });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return NextResponse.json({ error: error.errors }, { status: 400 });
+      return NextResponse.json({ error: 'Enter a valid email address' }, { status: 400 });
     }
     console.error('Forgot password error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

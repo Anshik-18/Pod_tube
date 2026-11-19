@@ -2,64 +2,79 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Riverside Pure Solid Dark Colors */
-:root {
-  --canvas: #121212;
-  --surface: #1a1a1a;
-  --surface-hover: #242424;
-  --border: #282828;
-  --primary: #6e56f8;
-  --text-primary: #ffffff;
-  --text-secondary: #aaaaaa;
-  --text-muted: #666666;
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body {
+    @apply bg-canvas text-ink antialiased;
+  }
+
+  body {
+    font-feature-settings: "cv11", "ss01";
+    overflow-x: hidden;
+  }
+
+  ::selection {
+    @apply bg-brand/40 text-white;
+  }
+
+  :focus-visible {
+    outline: 2px solid rgba(124, 92, 255, 0.7);
+    outline-offset: 2px;
+  }
+
+  input[type="range"] {
+    accent-color: #7c5cff;
+  }
 }
 
-body {
-  margin: 0;
-  padding: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  background-color: var(--canvas);
-  color: var(--text-primary);
-  -webkit-font-smoothing: antialiased;
-  overflow-x: hidden;
+@layer components {
+  .input {
+    @apply w-full rounded-lg border border-line bg-surface-2 px-3 py-2 text-sm text-ink placeholder:text-ink-faint
+      transition-colors focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25
+      disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium text-ink-muted;
+  }
+
+  .card {
+    @apply rounded-xl border border-line bg-surface;
+  }
+
+  .skeleton {
+    @apply rounded-md bg-gradient-to-r from-surface-2 via-surface-3 to-surface-2 bg-[length:200%_100%] animate-shimmer;
+  }
 }
 
-/* Custom Scrollbar */
+/* Scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 10px;
+  height: 10px;
 }
-
 ::-webkit-scrollbar-track {
-  background: var(--canvas);
+  background: transparent;
 }
-
 ::-webkit-scrollbar-thumb {
-  background: #282828;
+  background: #26262c;
   border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
 }
-
 ::-webkit-scrollbar-thumb:hover {
-  background: #383838;
+  background: #36363e;
+  background-clip: content-box;
 }
 
-/* Inputs & Form Fields Overrides */
-input[type="text"],
-input[type="email"],
-input[type="password"],
-select,
-textarea {
-  background-color: #1a1a1a !important;
-  border: 1px solid #282828 !important;
-  color: #ffffff !important;
-  border-radius: 0.75rem !important;
-}
-
-input[type="text"]:focus,
-input[type="email"]:focus,
-input[type="password"]:focus,
-select:focus,
-textarea:focus {
-  border-color: #6e56f8 !important;
-  box-shadow: 0 0 0 2px rgba(110, 86, 248, 0.25) !important;
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

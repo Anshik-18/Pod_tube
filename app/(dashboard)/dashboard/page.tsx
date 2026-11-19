@@ -1,192 +1,144 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { 
-  Upload, 
-  Scissors, 
-  Calendar, 
-  Users, 
-  Folder, 
-  MoreHorizontal, 
-  Plus,
-  Film,
-  Play
-} from 'lucide-react';
+import { Upload, ArrowRight, FolderOpen, Clock, CheckCircle2, Loader } from 'lucide-react';
 import { useAuth } from '@/components/providers/AuthProvider';
+import { useToast } from '@/components/ui/Toast';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { ButtonLink } from '@/components/ui/Button';
+import { EpisodeCard, EpisodeCardSkeleton, EpisodeSummary } from '@/components/episodes/EpisodeCard';
+import { useUploadRecording } from '@/components/episodes/UploadRecording';
+import { api } from '@/lib/client/api';
+import { displayNameFromEmail, formatDuration } from '@/lib/client/format';
 
-interface Episode {
-  id: string;
-  session_id: string;
-  title: string | null;
-  state: string;
-  file_references: Record<string, string> | null;
-  created_at: string;
+function greeting(): string {
+  const hour = new Date().getHours();
+  if (hour < 12) return 'Good morning';
+  if (hour < 18) return 'Good afternoon';
+  return 'Good evening';
+}
+
+function Stat({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
+  return (
+    <div className="card flex items-center gap-3 p-4">
+      <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-surface-3 text-ink-muted">{icon}</div>
+      <div>
+        <p className="text-xs text-ink-faint">{label}</p>
+        <p className="text-lg font-semibold tracking-tight">{value}</p>
+      </div>
+    </div>
+  );
 }
 
 export default function DashboardPage() {
-  const router = useRouter();
   const { user } = useAuth();
-  const [episodes, setEpisodes] = useState<Episode[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { showToast } = useToast();
+  const upload = useUploadRecording();
+  const [episodes, setEpisodes] = useState<EpisodeSummary[] | null>(null);
 
   useEffect(() => {
-    const fetchData = async () => {
-      if (!user) return;
-      try {
-        const token = localStorage.getItem('token');
-        const headers = { Authorization: `Bearer ${token}` };
+    api<{ episodes: EpisodeSummary[] }>('/api/episodes')
+      .then((data) => setEpisodes(data.episodes))
+      .catch(() => {
+        setEpisodes([]);
+        showToast('Couldn’t load your recordings', 'error');
+      });
+  }, [showToast]);
 
-        const episodeRes = await fetch('/api/episodes', { headers });
-        if (episodeRes.ok) {
-          const episodeData = await episodeRes.json();
-          setEpisodes(episodeData.episodes || []);
-        }
-      } catch (err) {
-        console.error('Error fetching dashboard data:', err);
-      } finally {
-        setLoading(false);
-      }
+  // Keep processing cards fresh
+  const hasProcessing = episodes?.some((e) => e.state === 'processing');
+  useEffect(() => {
+    if (!hasProcessing) return;
+    const interval = setInterval(() => {
+      api<{ episodes: EpisodeSummary[] }>('/api/episodes').then((data) => setEpisodes(data.episodes)).catch(() => {});
+    }, 8000);
+    return () => clearInterval(interval);
+  }, [hasProcessing]);
+
+  const stats = useMemo(() => {
+    const list = episodes ?? [];
+    return {
+      total: list.length,
+      ready: list.filter((e) => e.state === 'ready').length,
+      processing: list.filter((e) => e.state === 'processing').length,
+      minutes: list.reduce((sum, e) => sum + (e.file_references?.durationMs ?? 0), 0),
     };
+  }, [episodes]);
 
-    fetchData();
-  }, [user]);
-
-  const userName = user?.name || (user?.email ? user.email.split('@')[0] : 'My Studio');
+  const name = user?.name?.split(' ')[0] || displayNameFromEmail(user?.email);
 
   return (
-    <div className="space-y-8 max-w-7xl mx-auto bg-[#121212] min-h-screen p-2 text-white font-sans">
-      {/* Top Quick Action Buttons Row (Record & Upload) */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-2xl">
-        {/* Button 1: Record */}
-        <Link
-          href="/sessions/new"
-          className="p-4 rounded-xl bg-[#1a1a1a] border border-[#282828] hover:bg-[#242424] transition-colors flex items-center gap-3.5 group"
-        >
-          <div className="w-9 h-9 rounded-lg bg-[#282828] flex items-center justify-center shrink-0">
-            <div className="w-3.5 h-3.5 rounded-full border-2 border-red-500 flex items-center justify-center">
-              <div className="w-1.5 h-1.5 rounded-full bg-red-500"></div>
-            </div>
-          </div>
-          <div>
-            <div className="text-sm font-bold text-white">Record</div>
-            <div className="text-xs text-[#aaaaaa]">Start a new recording</div>
-          </div>
-        </Link>
-
-        {/* Button 2: Upload */}
-        <div className="p-4 rounded-xl bg-[#1a1a1a] border border-[#282828] hover:bg-[#242424] transition-colors flex items-center gap-3.5 cursor-pointer group">
-          <div className="w-9 h-9 rounded-lg bg-[#282828] flex items-center justify-center shrink-0 text-slate-300">
-            <Upload className="w-4 h-4" />
-          </div>
-          <div>
-            <div className="text-sm font-bold text-white">Upload</div>
-            <div className="text-xs text-[#aaaaaa]">Start with a file</div>
-          </div>
-        </div>
+    <div className="mx-auto max-w-6xl space-y-10">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">{greeting()}, {name}</h1>
+        <p className="mt-1 text-sm text-ink-muted">Record studio-quality conversations, then download polished episodes.</p>
       </div>
 
-      {/* Dynamic Recents Section */}
-      <div className="space-y-4 pt-2">
-        <div className="flex items-center justify-between">
-          <h2 className="text-2xl font-bold text-white tracking-tight">Recents</h2>
-          {episodes.length > 0 && (
-            <Link href="/episodes" className="text-xs font-bold text-[#6e56f8] hover:underline">
+      <div className="grid gap-3 sm:grid-cols-2 lg:max-w-3xl">
+        <Link href="/sessions/new" className="group card flex items-center gap-4 p-4 transition-colors hover:border-line-strong hover:bg-surface-2">
+          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-rec/15">
+            <span className="h-4 w-4 rounded-full bg-rec ring-4 ring-rec/25" />
+          </div>
+          <div className="flex-1">
+            <p className="text-sm font-semibold">Record</p>
+            <p className="text-xs text-ink-muted">Open a studio and invite up to 7 guests</p>
+          </div>
+          <ArrowRight className="h-4 w-4 text-ink-faint transition-transform group-hover:translate-x-0.5 group-hover:text-ink" />
+        </Link>
+        <button onClick={upload.open} disabled={upload.busy} className="group card flex items-center gap-4 p-4 text-left transition-colors hover:border-line-strong hover:bg-surface-2">
+          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand/15 text-brand-light">
+            <Upload className="h-5 w-5" />
+          </div>
+          <div className="flex-1">
+            <p className="text-sm font-semibold">Upload</p>
+            <p className="text-xs text-ink-muted">Turn a video or audio file into a project</p>
+          </div>
+          <ArrowRight className="h-4 w-4 text-ink-faint transition-transform group-hover:translate-x-0.5 group-hover:text-ink" />
+        </button>
+      </div>
+      {upload.element}
+
+      {episodes && episodes.length > 0 && (
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <Stat icon={<FolderOpen className="h-4 w-4" />} label="Projects" value={String(stats.total)} />
+          <Stat icon={<CheckCircle2 className="h-4 w-4" />} label="Ready to download" value={String(stats.ready)} />
+          <Stat icon={<Loader className="h-4 w-4" />} label="Processing" value={String(stats.processing)} />
+          <Stat icon={<Clock className="h-4 w-4" />} label="Recorded" value={formatDuration(stats.minutes)} />
+        </div>
+      )}
+
+      <section>
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-base font-semibold">Recent projects</h2>
+          {episodes && episodes.length > 0 && (
+            <Link href="/episodes" className="text-sm text-ink-muted hover:text-ink">
               View all
             </Link>
           )}
         </div>
 
-        {loading ? (
-          <div className="flex items-center gap-3 py-12 text-xs text-slate-400">
-            <div className="w-4 h-4 rounded-full border-2 border-[#6e56f8]/30 border-t-[#6e56f8] animate-spin" />
-            <span>Loading recent recordings...</span>
+        {episodes === null ? (
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {Array.from({ length: 3 }, (_, i) => (
+              <EpisodeCardSkeleton key={i} />
+            ))}
           </div>
-        ) : episodes.length > 0 ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-            {episodes.slice(0, 6).map((ep) => {
-              const epTitle = ep.title || `Episode ${ep.id.slice(0, 8)}`;
-
-              return (
-                <div key={ep.id} className="group flex flex-col space-y-2">
-                  {/* Dynamic Video Card Preview Thumbnail */}
-                  <Link
-                    href={`/episodes/${ep.id}`}
-                    className="aspect-video bg-[#141418] rounded-xl border border-[#282828] group-hover:border-[#6e56f8]/50 relative overflow-hidden flex items-center justify-center transition-colors"
-                  >
-                    <Film className="w-10 h-10 text-slate-700 group-hover:text-slate-500 transition-colors" />
-
-                    <div className="absolute inset-0 bg-black/40 backdrop-blur-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                      <div className="w-10 h-10 rounded-full bg-[#6e56f8] text-white flex items-center justify-center shadow-lg">
-                        <Play className="w-4 h-4 fill-current ml-0.5" />
-                      </div>
-                    </div>
-
-                    <span
-                      className={`absolute top-2.5 right-2.5 px-2 py-0.5 rounded text-[10px] font-bold ${
-                        ep.state === 'ready'
-                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                          : ep.state === 'processing'
-                          ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                          : 'bg-red-500/20 text-red-400 border border-red-500/30'
-                      }`}
-                    >
-                      {ep.state.toUpperCase()}
-                    </span>
-                  </Link>
-
-                  {/* Metadata Row */}
-                  <div className="flex items-start justify-between">
-                    <div className="space-y-0.5">
-                      <Link
-                        href={`/episodes/${ep.id}`}
-                        className="text-sm font-bold text-white hover:text-[#6e56f8] transition-colors truncate block max-w-[220px]"
-                      >
-                        {epTitle}
-                      </Link>
-                      <div className="text-xs text-[#aaaaaa]">
-                        Recorded {new Date(ep.created_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}
-                      </div>
-                      <div className="flex items-center gap-1.5 text-xs text-[#aaaaaa]">
-                        <Folder className="w-3.5 h-3.5 text-[#666666]" />
-                        <span>{userName}</span>
-                      </div>
-                    </div>
-
-                    <Link href={`/episodes/${ep.id}`} className="p-1 text-[#aaaaaa] hover:text-white">
-                      <MoreHorizontal className="w-4 h-4" />
-                    </Link>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+        ) : episodes.length === 0 ? (
+          <EmptyState
+            icon={<FolderOpen className="h-5 w-5" />}
+            title="No recordings yet"
+            description="Start a studio session to record yourself and your guests in full local quality."
+            action={<ButtonLink href="/sessions/new" variant="record">Start recording</ButtonLink>}
+          />
         ) : (
-          <div className="bg-[#1a1a1a] border border-[#282828] rounded-2xl p-8 text-center space-y-3">
-            <Film className="w-10 h-10 text-slate-600 mx-auto" />
-            <h3 className="text-sm font-bold text-white">No recent recordings</h3>
-            <p className="text-xs text-[#aaaaaa] max-w-sm mx-auto">
-              Start a new studio session to record high quality video & audio tracks.
-            </p>
-            <Link
-              href="/sessions/new"
-              className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#6e56f8] hover:bg-[#5e44f6] text-white font-bold text-xs rounded-xl shadow-lg transition-all"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Start Recording</span>
-            </Link>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {episodes.slice(0, 6).map((ep) => (
+              <EpisodeCard key={ep.id} episode={ep} />
+            ))}
           </div>
         )}
-      </div>
-
-      {/* Analytics Section */}
-      <div className="pt-4 space-y-4">
-        <h2 className="text-2xl font-bold text-white tracking-tight">Analytics</h2>
-        <div className="p-6 rounded-xl bg-[#1a1a1a] border border-[#282828] text-sm text-[#aaaaaa]">
-          Analytics dashboard overview...
-        </div>
-      </div>
+      </section>
     </div>
   );
 }

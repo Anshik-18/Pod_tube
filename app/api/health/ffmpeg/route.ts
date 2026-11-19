@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 
+export const dynamic = 'force-dynamic';
+
 const execAsync = promisify(exec);
 
 export async function GET() {
@@ -24,9 +26,6 @@ export async function GET() {
       );
     }
 
-    console.log('[FFmpeg Health Check] FFmpeg is installed and working');
-    console.log('[FFmpeg Health Check] Path:', process.env.FFMPEG_PATH || 'ffmpeg');
-    console.log('[FFmpeg Health Check] Version:', version);
 
     return NextResponse.json({
       installed: true,
