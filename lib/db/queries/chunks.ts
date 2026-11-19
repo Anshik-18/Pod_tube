@@ -3,7 +3,7 @@ import { getDbPool } from '../client';
 export interface RecordingChunk {
   id: string;
   session_id: string;
-  participant_type: 'host' | 'guest';
+  participant_type: string;
   chunk_index: number;
   storage_key: string;
   size_bytes: number;
@@ -14,41 +14,12 @@ export interface RecordingChunk {
   updated_at: string;
 }
 
-let tableInitialized = false;
-
-/**
- * Initialize recording_chunks table if not exists
- */
-async function ensureTable(): Promise<void> {
-  if (tableInitialized) return;
-  const pool = getDbPool();
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS recording_chunks (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-      participant_type VARCHAR(50) NOT NULL,
-      chunk_index INTEGER NOT NULL,
-      storage_key VARCHAR(500) NOT NULL,
-      size_bytes BIGINT NOT NULL DEFAULT 0,
-      etag VARCHAR(255),
-      status VARCHAR(50) NOT NULL DEFAULT 'pending',
-      attempts INTEGER DEFAULT 0,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-      UNIQUE(session_id, participant_type, chunk_index)
-    );
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_recording_chunks_session ON recording_chunks(session_id, participant_type);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_recording_chunks_status ON recording_chunks(status);`);
-  tableInitialized = true;
-}
-
 /**
  * Upsert chunk record in recording_chunks
  */
 export async function recordChunkMetadata(
   sessionId: string,
-  participantType: 'host' | 'guest',
+  participantType: string,
   chunkIndex: number,
   storageKey: string,
   sizeBytes: number,
@@ -56,7 +27,6 @@ export async function recordChunkMetadata(
   attempts = 0,
   etag: string | null = null
 ): Promise<RecordingChunk> {
-  await ensureTable();
   const pool = getDbPool();
 
   const result = await pool.query<RecordingChunk>(
@@ -83,13 +53,12 @@ export async function recordChunkMetadata(
  */
 export async function updateChunkStatus(
   sessionId: string,
-  participantType: 'host' | 'guest',
+  participantType: string,
   chunkIndex: number,
   status: 'pending' | 'uploading' | 'completed' | 'failed',
   attempts?: number,
   etag?: string | null
 ): Promise<RecordingChunk | null> {
-  await ensureTable();
   const pool = getDbPool();
 
   const setClauses = ['status = $1', 'updated_at = NOW()'];
@@ -124,9 +93,8 @@ export async function updateChunkStatus(
  */
 export async function getSessionChunks(
   sessionId: string,
-  participantType: 'host' | 'guest'
+  participantType: string
 ): Promise<RecordingChunk[]> {
-  await ensureTable();
   const pool = getDbPool();
 
   const result = await pool.query<RecordingChunk>(
@@ -143,7 +111,6 @@ export async function getSessionChunks(
  * Get all chunks for a session across all participants, ordered by participant_type and chunk_index ASC.
  */
 export async function getAllSessionChunks(sessionId: string): Promise<RecordingChunk[]> {
-  await ensureTable();
   const pool = getDbPool();
 
   const result = await pool.query<RecordingChunk>(
@@ -162,7 +129,7 @@ export async function getAllSessionChunks(sessionId: string): Promise<RecordingC
  */
 export async function verifyChunkIntegrity(
   sessionId: string,
-  participantType: 'host' | 'guest',
+  participantType: string,
   expectedTotalChunks: number
 ): Promise<{ valid: boolean; missingIndices: number[]; failedIndices: number[]; totalFound: number }> {
   const chunks = await getSessionChunks(sessionId, participantType);
@@ -196,7 +163,6 @@ export async function verifyChunkIntegrity(
  * Delete all recording chunks for a session from database
  */
 export async function deleteSessionChunks(sessionId: string): Promise<number> {
-  await ensureTable();
   const pool = getDbPool();
 
   const result = await pool.query(
@@ -205,4 +171,14 @@ export async function deleteSessionChunks(sessionId: string): Promise<number> {
   );
 
   return result.rowCount || 0;
+}
+
+/** Every track id that has (or had) chunks in this session. */
+export async function getChunkParticipantTypes(sessionId: string): Promise<string[]> {
+  const pool = getDbPool();
+  const result = await pool.query<{ participant_type: string }>(
+    'SELECT DISTINCT participant_type FROM recording_chunks WHERE session_id = $1',
+    [sessionId]
+  );
+  return result.rows.map((r) => r.participant_type);
 }

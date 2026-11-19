@@ -57,3 +57,4 @@ jest.setup.js
 # Development files
 ENV_SETUP.md
 MISSING_FEATURES.md
+.processing

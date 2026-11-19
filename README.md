@@ -4,17 +4,30 @@ A beginner-friendly video podcast recording application built with Next.js, WebR
 
 ## Features
 
-- **User Authentication**: Sign up and login with email/password
-- **Session Management**: Create recording sessions and share guest links
-- **WebRTC Video Calls**: Real-time peer-to-peer video communication
-- **Local Recording**: Browser-based recording with separate tracks per participant
-- **Chunked Uploads**: Resumable file uploads with progress tracking
-- **Server-Side Processing**: FFmpeg-based video/audio merging and trimming
-- **Episode Management**: View, edit, and download completed episodes
-- **Episode Search & Filter**: Search by title/ID and filter by state
-- **User Settings**: Update email and password
-- **Episode Descriptions**: Add notes and descriptions to episodes
-- **Processing Progress**: Real-time progress tracking with percentage
+**Studio**
+- **Up to 8 people** (host + 7 guests) from one invite link — peer-to-peer mesh, no SFU needed
+- Pre-join device check: live HD preview, camera/mic/speaker pickers, mic level meter, speaker test, audio-only fallback when no camera is available
+- Local recording of every participant (up to 1080p, 48 kHz audio) — independent of call quality; the live call adapts its bitrate to the room size
+- **Screen sharing**, shown live to everyone and recorded as its own track
+- Server-synchronized 3-2-1 countdown; late joiners are recorded automatically
+- **Crash-safe**: someone who refreshes or crashes mid-recording rejoins as a new segment of their own track (nothing already uploaded is lost)
+- Progressive, resilient uploads (5 s chunks saved to disk first, retries with backoff, pauses while offline, manual retry)
+- Auto grid, speaker view with filmstrip, pin anyone to the stage, active-speaker highlight, per-person connection quality
+- Host controls: ask a guest to mute, remove a guest; live upload status for everyone after recording
+- Chat, private notes, markers (`M`), mute/camera shortcuts (`⌘/Ctrl+D`, `⌘/Ctrl+E`)
+
+**Projects**
+- Automatic processing: tracks are synchronized on a shared server clock and composited into an auto grid (1–8 people), switching to a screen + camera-sidebar layout while someone shares their screen
+- If a guest never finishes uploading, the host can **Process now** with the tracks that arrived
+- Live processing progress, readable errors and one-click retry
+- Trim (set from the playhead), Draft/Standard/High export quality, re-export at any time
+- Downloads: MP4 episode, MP3 audio, and every participant's original **separate track** (cameras, rejoin segments and screen shares)
+- Thumbnails, markers on the timeline, notes, search/filter/sort and bulk delete
+- Upload an existing video or audio file to create a project
+
+**Platform**
+- Schema migrations run automatically on server start (`lib/db/migrate.ts`)
+- Local disk or Cloudflare R2/S3 storage; large files stream instead of buffering in memory
 
 ## Tech Stack
 
@@ -23,7 +36,7 @@ A beginner-friendly video podcast recording application built with Next.js, WebR
 - **Database**: PostgreSQL
 - **Real-time**: Socket.io (WebSocket)
 - **Storage**: Local filesystem (S3-compatible abstraction layer)
-- **Processing**: FFmpeg (fluent-ffmpeg)
+- **Processing**: FFmpeg (spawned directly by the background worker in `lib/worker`)
 - **Testing**: Jest, React Testing Library
 
 ## Prerequisites
@@ -116,6 +129,87 @@ A beginner-friendly video podcast recording application built with Next.js, WebR
    ```
 
    The app will be available at `http://localhost:3000`
+
+## Local development (quick start)
+
+```bash
+# 1. Postgres in a container (or point DATABASE_URL at any Postgres 14+)
+podman run -d --name podnow-pg -e POSTGRES_USER=podnow -e POSTGRES_PASSWORD=podnow -e POSTGRES_DB=podnow \
+  -p 5432:5432 -v podnow-pgdata:/var/lib/postgresql/data docker.io/library/postgres:16-alpine
+podman exec -i podnow-pg psql -U podnow -d podnow < lib/db/schema.sql
+
+# 2. .env.local (gitignored) overrides .env
+DATABASE_URL=postgresql://podnow:podnow@localhost:5432/podnow
+STORAGE_TYPE=local
+STORAGE_LOCAL_DIR=./uploads
+
+# 3. Run
+npm install && npm run dev        # PORT=3100 npm run dev to use another port
+```
+
+FFmpeg must be on the PATH. Distro builds without x264 (e.g. Fedora's `ffmpeg-free`) work too: the worker detects the
+available H.264 encoder and falls back to OpenH264.
+
+## How multi-person recording works
+
+| Piece | Where |
+|---|---|
+| Participant ids: `host`, `guest-<key>`, `<id>.screen<n>`, `<id>.part<n>` | `lib/participants.ts` |
+| Signaling, room capacity, host controls, recording clock, segment assignment | `lib/websocket/server.ts` |
+| Browser mesh (fixed audio / camera / screen transceivers, no renegotiation) | `lib/webrtc/mesh.ts` |
+| One local recorder + upload queue + finalize per track | `lib/recording/track-recorder.ts` |
+| "Everyone finished?" → start processing (and the host's *Process now*) | `lib/sessions/completion.ts` |
+| Scene timeline, layouts, per-scene video + single audio mix (FFmpeg) | `lib/worker/scenes.ts`, `lib/worker/merge-stage.ts` |
+
+Each guest's browser keeps a stable guest key per invite (localStorage), so a refresh continues as the same person.
+
+## Recording reliability & scale
+
+What happens to a recording, end to end, and what it survives:
+
+| Situation | Behaviour |
+|---|---|
+| Slow uplink / long take | Each 5 s chunk is written to the browser's **IndexedDB (on disk)** first; only the chunk being uploaded is held in memory, so a 1-hour backlog doesn't grow RAM. Uploads run one at a time while recording (the live call keeps its bandwidth) and three at a time after Stop. |
+| Network drops | Uploads pause while offline (without spending retries) and resume automatically. |
+| Tab crash / closed / refresh | Unsent chunks stay on disk. Reopening the studio link finds them, tells the server to keep that track open, uploads them and finalizes with the timing saved while recording. A rejoin mid-recording continues as a new segment (`.part2`) in the same tile. |
+| Chunk lost for good | The worker assembles **around** the gap (the WebM demuxer resyncs at the next cluster, timestamps intact) and drops the few undecodable frames up to the next keyframe. The picture holds and audio is silent for the missing seconds; everything after stays in sync. The project page lists what's missing and where. Only chunk 0 (the codec header) is essential. |
+| Phantom uploads | `chunk-confirm` checks the object really exists in storage before marking a chunk uploaded. |
+| Everyone stops at once | Exactly one processing job is queued (atomic session transition + unique index). |
+| Worker dies mid-job | Jobs without a progress heartbeat for 15 min are requeued. |
+| Someone never comes back | A session waiting on uploads with no activity for 10 min is processed with what arrived (the host can also click **Process now**). |
+
+### How people who come and go fit into the episode
+
+Every track is stamped with its start/end in **server time** (each browser measures its clock offset
+when it connects), so pieces recorded on different machines — and a person's segments before and after
+a rejoin — land at the right moment. Verified with cameras that draw the wall-clock time: all tiles in
+the final video agree to within 1–2 frames, across a crash, a rejoin and a late join.
+
+The episode is cut into **scenes** (`lib/worker/scenes.ts`) so the layout follows who is actually there:
+
+| Situation | In the episode |
+|---|---|
+| Late joiner | Enters the layout when they join — no empty slot before |
+| Absent > 20 s (left, crashed and came back later) | Leaves the layout, everyone else reflows; returns in their slot when they rejoin |
+| Absent ≤ 20 s (a blip) | Keeps their slot with a placeholder card, so the layout doesn't jump |
+| Leaves for good | Removed from the layout at the moment they left |
+| Screen share | Screen + camera sidebar for exactly that span |
+
+Scenes shorter than 1.5 s are folded into a neighbour, and boundaries are snapped to whole frames.
+Each scene is encoded separately (only the people in it are decoded), the audio is mixed once for the
+whole timeline, and scenes are joined with a stream-copy concat — no re-encode, no drift.
+
+**Measured** on a laptop (Ryzen 5 5600H) with two 26-minute 1080p tracks (2.26 GB of chunks, 3 chunks missing):
+about 15 min to process from chunks, **~540 MB peak RAM for the whole worker** (Node + FFmpeg; flat over
+the whole recording and independent of gap size — it was ~2.1 GB before gap handling was fixed), and peak
+scratch disk **1.5× the input** (chunk files are deleted as they're joined). Downloads run 6 in parallel;
+outputs over 100 MB go to R2/S3 as multipart uploads (no 5 GB single-PUT limit).
+
+Worker settings:
+
+- `PROCESSING_WORK_DIR` — scratch directory for processing (default: the OS temp dir, or `./.processing`
+  if the temp dir is a RAM-backed tmpfs, as on Fedora). Needs ~1.5–3× the recording size free; the
+  worker checks free space before starting and fails with a clear message instead of `ENOSPC`.
 
 ## Testing
 

@@ -23,6 +23,9 @@ export const PUT = withAuth(async (req: AuthenticatedRequest, context?: { params
     if (typeof description !== 'string' && description !== null) {
       return NextResponse.json({ error: 'Invalid description' }, { status: 400 });
     }
+    if (typeof description === 'string' && description.length > 5000) {
+      return NextResponse.json({ error: 'Notes must be 5,000 characters or fewer' }, { status: 400 });
+    }
 
     const updatedEpisode = await updateEpisodeDescription(params.id, description || '');
 

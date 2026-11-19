@@ -2,6 +2,41 @@ import { getDbPool } from '../client';
 
 export type EpisodeState = 'processing' | 'ready' | 'failed';
 
+export type ExportQuality = 'low' | 'medium' | 'high';
+
+export interface TrimSettings {
+  trimStart?: number;
+  trimEnd?: number;
+  quality?: ExportQuality;
+}
+
+/** Storage keys and media metadata produced by the processing worker. */
+export interface EpisodeFiles {
+  video?: string;
+  audio?: string;
+  thumbnail?: string;
+  /** Untouched per-participant source recordings (the "separate tracks"). */
+  tracks?: Record<string, string>;
+  durationMs?: number;
+  /** Length of the untrimmed source timeline, used to drive the trim editor. */
+  sourceDurationMs?: number;
+  width?: number;
+  height?: number;
+  fileSizeBytes?: number;
+  /** Tracks that were incomplete or unusable, so the host knows what's missing and where. */
+  warnings?: TrackWarning[];
+}
+
+export interface TrackWarning {
+  participant: string;
+  kind: 'gaps' | 'unusable';
+  /** Seconds lost, for kind 'gaps'. */
+  missingSeconds?: number;
+  /** Where in the track (seconds from that track's start). */
+  gaps?: Array<{ start: number; end: number }>;
+  message?: string;
+}
+
 export interface Episode {
   id: string;
   session_id: string;
@@ -9,61 +44,15 @@ export interface Episode {
   title: string | null;
   description: string | null;
   state: EpisodeState;
-  file_references: Record<string, string> | null;
-  trim_settings: { trimStart?: number; trimEnd?: number; quality?: 'low' | 'medium' | 'high' } | null;
+  file_references: EpisodeFiles | null;
+  trim_settings: TrimSettings | null;
   created_at: Date;
-}
-
-let constraintInitialized = false;
-
-/**
- * Ensures duplicate episodes per session are cleaned up and a UNIQUE constraint
- * on (session_id) exists in PostgreSQL.
- */
-async function ensureUniqueEpisodeSessionIdConstraint(): Promise<void> {
-  if (constraintInitialized) return;
-  const pool = getDbPool();
-  try {
-    // 1. Detect and safely remove duplicate processing_jobs and episodes for the same session_id,
-    // keeping the earliest created episode (MIN created_at, MIN id).
-    await pool.query(`
-      DELETE FROM processing_jobs
-      WHERE episode_id IN (
-        SELECT id FROM (
-          SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at ASC, id ASC) as row_num
-          FROM episodes
-        ) duplicates
-        WHERE duplicates.row_num > 1
-      );
-    `);
-
-    await pool.query(`
-      DELETE FROM episodes
-      WHERE id IN (
-        SELECT id FROM (
-          SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at ASC, id ASC) as row_num
-          FROM episodes
-        ) duplicates
-        WHERE duplicates.row_num > 1
-      );
-    `);
-
-    // 2. Create UNIQUE index/constraint on (session_id)
-    await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_unique_session_id ON episodes(session_id);
-    `);
-
-    constraintInitialized = true;
-  } catch (err) {
-    // Non-critical if index already exists
-  }
 }
 
 /**
  * Get an episode directly by session_id
  */
 export async function getEpisodeBySessionId(sessionId: string): Promise<Episode | null> {
-  await ensureUniqueEpisodeSessionIdConstraint();
   const pool = getDbPool();
   const result = await pool.query<Episode>(
     'SELECT * FROM episodes WHERE session_id = $1 ORDER BY created_at ASC LIMIT 1',
@@ -80,7 +69,6 @@ export async function createEpisode(
   hostId: string,
   title?: string
 ): Promise<Episode> {
-  await ensureUniqueEpisodeSessionIdConstraint();
   const pool = getDbPool();
 
   try {
@@ -117,7 +105,7 @@ export async function getEpisodeById(id: string): Promise<Episode | null> {
 export async function updateEpisodeState(
   id: string,
   state: EpisodeState,
-  fileReferences?: Record<string, string>
+  fileReferences?: EpisodeFiles
 ): Promise<Episode> {
   const pool = getDbPool();
   let query: string;
@@ -139,7 +127,7 @@ export async function updateEpisodeTrimSettings(
   id: string,
   trimStart?: number,
   trimEnd?: number,
-  quality?: 'low' | 'medium' | 'high'
+  quality?: ExportQuality
 ): Promise<Episode> {
   const pool = getDbPool();
   const trimSettings = { trimStart, trimEnd, quality };

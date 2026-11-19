@@ -5,10 +5,7 @@ import path from 'path';
 import { initializeSocketIO, getSocketIO } from './lib/websocket/server';
 import { startProcessingWorker, stopProcessingWorker } from './lib/worker/processing-worker';
 import { closeDbPool } from './lib/db/client';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
+import { runMigrations } from './lib/db/migrate';
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = dev ? 'localhost' : (process.env.HOSTNAME || '0.0.0.0');
@@ -38,26 +35,17 @@ function validateEnv() {
     if (!process.env.R2_BUCKET_NAME && !process.env.AWS_S3_BUCKET) requiredVars.push('R2_BUCKET_NAME');
   }
 
+  if (storageType !== 'r2' && storageType !== 's3' && process.env.ALLOW_LOCAL_STORAGE !== 'true') {
+    throw new Error(
+      `STORAGE_TYPE="${process.env.STORAGE_TYPE ?? ''}" keeps recordings on the container's disk. Use STORAGE_TYPE=r2, ` +
+        'or set ALLOW_LOCAL_STORAGE=true if this single server has a persistent volume for uploads.'
+    );
+  }
+
   const missing = requiredVars.filter((v) => !process.env[v]);
   if (missing.length > 0) {
     console.error(`[Env Error] CRITICAL: Missing required environment variable(s) for production deployment: ${missing.join(', ')}`);
     throw new Error(`Missing required production environment variables: ${missing.join(', ')}`);
-  }
-}
-
-// Check FFmpeg availability on startup
-async function checkFFmpeg() {
-  try {
-    const ffmpegBin = process.env.FFMPEG_PATH ? `"${process.env.FFMPEG_PATH}"` : 'ffmpeg';
-    const { stdout: version } = await execAsync(`${ffmpegBin} -version`);
-    const versionLine = version.split('\n')[0];
-    console.log('[FFmpeg] ✓ FFmpeg is installed and available');
-    console.log(`[FFmpeg] ${versionLine.trim()}`);
-  } catch (error: any) {
-    console.warn('[FFmpeg] ⚠️  FFmpeg is not installed or not in PATH.');
-    console.warn('[FFmpeg] Video merging feature requires FFmpeg.');
-    console.warn('[FFmpeg] Actual error:', error?.message || error);
-    if (error?.stderr) console.warn('[FFmpeg] stderr:', error.stderr);
   }
 }
 
@@ -68,8 +56,13 @@ const app = next({ dev, hostname, port, dir: path.resolve(__dirname) });
 const handle = app.getRequestHandler();
 
 app.prepare().then(async () => {
-  // Check FFmpeg status on startup
-  await checkFFmpeg();
+  // Bring the database schema up to date before serving requests
+  try {
+    await runMigrations();
+  } catch (err) {
+    console.error('[Migrate] Failed to apply schema migrations:', err);
+    process.exit(1);
+  }
 
   const httpServer = createServer((req, res) => {
     const parsedUrl = parse(req.url!, true);

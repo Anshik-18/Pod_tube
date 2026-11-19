@@ -72,10 +72,15 @@ COPY --from=builder /app/.next ./.next
 # Copy public directory (Next.js static assets)
 COPY --from=builder /app/public ./public
 
-# Copy custom server and required source files
+# Copy custom server and required source files (lib/db/schema.sql bootstraps a fresh database)
 COPY --from=builder /app/server.ts ./
 COPY --from=builder /app/lib ./lib
 COPY --from=builder /app/tsconfig.json ./
+
+# Scratch space for the processing worker (needs ~2-3x a recording's size; mount a volume here
+# on hosts with small disks). Local-storage uploads, if used, go to /app/uploads.
+ENV PROCESSING_WORK_DIR=/app/.processing
+RUN mkdir -p /app/.processing /app/uploads
 
 # Set ownership
 RUN chown -R nextjs:nodejs /app
@@ -87,6 +92,10 @@ EXPOSE 3000
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
-# Start the custom server using tsx
-# Diagnostic: print PATH and check ffmpeg before starting
-CMD ["/bin/sh", "-c", "echo \"PATH=$PATH\" && echo \"which ffmpeg:\" && which ffmpeg || true && echo \"ls /usr/bin/ff*:\" && ls /usr/bin/ff* || true && npx tsx server.ts"]
+# The platform checks this to know the app (and its database connection) is healthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${PORT}/api/health" > /dev/null || exit 1
+
+# Exec form (no shell wrapper) so SIGTERM reaches Node and server.ts shuts down gracefully:
+# stops accepting connections, lets the processing worker finish its step, closes the DB pool.
+CMD ["node_modules/.bin/tsx", "server.ts"]

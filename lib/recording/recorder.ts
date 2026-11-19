@@ -191,17 +191,26 @@ export class BrowserRecorder {
     }
   }
 
+  getMimeType(): string {
+    return this.mediaRecorder?.mimeType || '';
+  }
+
   getState(): string {
     return this.mediaRecorder?.state || 'inactive';
   }
 
-  /**
-   * @deprecated Use setChunkHandler() instead for real-time streaming.
-   */
-  setOnDataAvailable(callback: (chunk: Blob) => void): void {
-    this.chunkHandler = {
-      onChunk: (_index: number, blob: Blob) => callback(blob),
-    };
+  /** Stop recording without stopping the source tracks (they're still used by the call). */
+  cleanupRecorderOnly(): void {
+    if (this.mediaRecorder) {
+      try {
+        if (this.mediaRecorder.state !== 'inactive') this.mediaRecorder.stop();
+      } catch {
+        // Ignore
+      }
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder = null;
+    }
+    this.chunkHandler = null;
   }
 
   cleanup(): void {
@@ -225,15 +234,16 @@ export class BrowserRecorder {
   }
 
   private getSupportedMimeTypes(): string[] {
+    // H.264 first: Chrome/Edge encode it in hardware on most machines (and with OpenH264 in
+    // software elsewhere, still cheaper than libvpx), leaving CPU for the live call. The worker
+    // stores H.264 tracks as MKV. VP8 is the fallback; Safari only offers MP4.
     const types = [
-      'video/webm;codecs=vp9,opus',
-      'video/webm;codecs=vp8,opus',
-      'video/webm;codecs=vp9',
-      'video/webm;codecs=vp8',
-      'video/webm',
-      'video/mp4',
       'video/webm;codecs=h264,opus',
-      'video/webm;codecs=h264',
+      'video/webm;codecs=vp8,opus',
+      'video/webm;codecs=vp9,opus',
+      'video/webm',
+      'video/mp4;codecs=avc1,mp4a.40.2',
+      'video/mp4',
     ];
 
     return types.filter(type => MediaRecorder.isTypeSupported(type));

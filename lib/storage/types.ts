@@ -54,4 +54,22 @@ export interface StorageProvider {
    * @returns Promise resolving to presigned upload URL, or null if not supported
    */
   getPresignedUploadUrl?(path: string, expiresInSeconds?: number): Promise<string>;
+
+  /**
+   * Upload a file from the local filesystem without buffering it in memory
+   * @param path Logical destination path
+   * @param localFilePath Absolute path of the source file
+   */
+  saveFile(path: string, localFilePath: string): Promise<void>;
+
+  /**
+   * Size in bytes of a stored object, or null if it does not exist
+   */
+  size(path: string): Promise<number | null>;
+
+  /**
+   * Short-lived URL that downloads (or streams inline) the object directly from storage.
+   * Providers without direct URLs (local disk) omit this and are streamed by the API.
+   */
+  getSignedDownloadUrl?(path: string, options: { filename?: string; inline?: boolean; contentType?: string; expiresInSeconds?: number }): Promise<string>;
 }

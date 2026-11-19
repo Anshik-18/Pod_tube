@@ -26,9 +26,17 @@ export class LocalStorageProvider implements StorageProvider {
   }
 
   private getFullPath(logicalPath: string): string {
-    // Normalize path to prevent directory traversal
-    const normalized = path.normalize(logicalPath).replace(/^(\.\.(\/|\\|$))+/, '');
-    return path.join(this.baseDir, normalized);
+    // Resolve and confine to baseDir to prevent directory traversal
+    const fullPath = path.resolve(this.baseDir, logicalPath.replace(/^[\\/]+/, ''));
+    if (fullPath !== this.baseDir && !fullPath.startsWith(this.baseDir + path.sep)) {
+      throw new Error(`Invalid storage path: ${logicalPath}`);
+    }
+    return fullPath;
+  }
+
+  /** Absolute filesystem path for a stored object (used for ranged streaming). */
+  resolvePath(logicalPath: string): string {
+    return this.getFullPath(logicalPath);
   }
 
   async save(filePath: string, data: Buffer | NodeJS.ReadableStream): Promise<void> {
@@ -45,7 +53,7 @@ export class LocalStorageProvider implements StorageProvider {
       const writeStream = createWriteStream(fullPath);
       return new Promise((resolve, reject) => {
         data.pipe(writeStream);
-        data.on('end', resolve);
+        writeStream.on('finish', () => resolve());
         data.on('error', reject);
         writeStream.on('error', reject);
       });
@@ -99,6 +107,22 @@ export class LocalStorageProvider implements StorageProvider {
   async getStream(filePath: string): Promise<NodeJS.ReadableStream> {
     const fullPath = this.getFullPath(filePath);
     return createReadStream(fullPath);
+  }
+
+  async saveFile(filePath: string, localFilePath: string): Promise<void> {
+    await this.ensureBaseDir();
+    const fullPath = this.getFullPath(filePath);
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.copyFile(localFilePath, fullPath);
+  }
+
+  async size(filePath: string): Promise<number | null> {
+    try {
+      const stat = await fs.stat(this.getFullPath(filePath));
+      return stat.size;
+    } catch {
+      return null;
+    }
   }
 
   async getUrl(filePath: string): Promise<string> {

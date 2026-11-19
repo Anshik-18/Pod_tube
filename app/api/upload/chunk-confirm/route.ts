@@ -1,80 +1,50 @@
 import { NextResponse } from 'next/server';
 import { withAuth, AuthenticatedRequest } from '@/lib/auth/middleware';
+import { authorizeParticipantUpload, isChunkIndex, chunkStorageKey } from '@/lib/auth/session-access';
+import { getStorageProvider } from '@/lib/storage';
 import { updateChunkStatus } from '@/lib/db/queries/chunks';
-import { getDbPool } from '@/lib/db/client';
 
 /**
  * POST /api/upload/chunk-confirm
- * 
- * Debug mode: Logs exact input parameters, queries DB rows for session, and logs updateChunkStatus return value.
+ *
+ * Marks a directly-uploaded (presigned PUT) chunk as completed.
+ * Body: { sessionId, participantType, chunkIndex, etag?, sizeBytes? }
  */
 export const POST = withAuth(async (req: AuthenticatedRequest) => {
   try {
-    const body = await req.json();
-    const { sessionId, participantType, chunkIndex, etag, sizeBytes } = body;
+    const { sessionId, participantType, chunkIndex, etag } = await req.json();
 
-    console.log('[DEBUG chunk-confirm] Input parameters:', {
-      sessionId,
-      sessionIdType: typeof sessionId,
-      participantType,
-      participantTypeType: typeof participantType,
-      chunkIndex,
-      chunkIndexType: typeof chunkIndex,
-      etag,
-      sizeBytes,
-    });
-
-    if (!sessionId || !participantType || chunkIndex === undefined || chunkIndex === null) {
-      return NextResponse.json(
-        { error: 'Missing required fields' },
-        { status: 400 }
-      );
+    if (!isChunkIndex(chunkIndex)) {
+      return NextResponse.json({ error: 'Invalid chunkIndex' }, { status: 400 });
     }
 
-    // Immediately before updateChunkStatus(), execute SELECT
-    const pool = getDbPool();
-    const debugRows = await pool.query(
-      'SELECT session_id, participant_type, chunk_index, status FROM recording_chunks WHERE session_id = $1',
-      [sessionId]
-    );
+    // Confirmation may legitimately arrive after the session moved to processing; only authorize identity.
+    const access = await authorizeParticipantUpload(req, sessionId, participantType, { requireUploadable: false });
+    if (!access.ok) return access.response;
 
-    console.log('[DEBUG chunk-confirm] Existing DB rows for session:', debugRows.rows);
-    console.log('[DEBUG chunk-confirm] Exact values passed into updateChunkStatus:', {
-      sessionId,
-      participantType,
-      chunkIndex,
-      status: 'completed',
-      attempts: undefined,
-      etag: etag || null,
-    });
+    // Don't take the browser's word for it: the object must really be in storage. A missing
+    // object makes the client retry this chunk now instead of failing at finalize.
+    const storedSize = await getStorageProvider().size(chunkStorageKey(access.session.id, participantType, chunkIndex));
+    if (!storedSize) {
+      return NextResponse.json({ error: 'Chunk not found in storage; upload it again' }, { status: 409 });
+    }
 
     const updated = await updateChunkStatus(
-      sessionId,
-      participantType as 'host' | 'guest',
+      access.session.id,
+      participantType,
       chunkIndex,
       'completed',
       undefined,
-      etag || null
+      typeof etag === 'string' ? etag : null
     );
-
-    console.log('[DEBUG chunk-confirm] updateChunkStatus return value:', updated);
 
     if (!updated) {
-      return NextResponse.json(
-        { error: 'Chunk record not found' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Chunk record not found' }, { status: 404 });
     }
 
-    return NextResponse.json({
-      chunkIndex,
-      status: 'completed',
-    });
+    return NextResponse.json({ chunkIndex, status: 'completed' });
   } catch (error) {
     console.error('[chunk-confirm] Error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
-});
+}, { allowGuest: true });

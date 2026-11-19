@@ -37,3 +37,7 @@ next-env.d.ts
 
 # uploads
 /uploads
+.dev-test-account
+
+# Worker scratch space (see PROCESSING_WORK_DIR)
+.processing/

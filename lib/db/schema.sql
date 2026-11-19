@@ -1,10 +1,14 @@
 -- Database schema for PodNow
+-- Fresh installs: run this file. Existing databases are upgraded automatically by lib/db/migrate.ts on server start.
 
 -- Users table
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   email VARCHAR(255) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
+  name VARCHAR(255),
+  password_reset_token VARCHAR(255),
+  password_reset_expires TIMESTAMP WITH TIME ZONE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -15,7 +19,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   host_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   guest_token VARCHAR(255) UNIQUE NOT NULL,
+  title VARCHAR(255),
   state VARCHAR(50) NOT NULL DEFAULT 'idle',
+  markers JSONB NOT NULL DEFAULT '[]'::jsonb,
+  participant_names JSONB NOT NULL DEFAULT '{}'::jsonb,
   recording_started_at TIMESTAMP WITH TIME ZONE,
   total_chunks INTEGER,
   recording_duration INTEGER,
@@ -33,6 +40,7 @@ CREATE TABLE IF NOT EXISTS episodes (
   session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   host_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   title VARCHAR(255),
+  description TEXT,
   state VARCHAR(50) NOT NULL DEFAULT 'processing',
   file_references JSONB,
   trim_settings JSONB,
@@ -68,12 +76,14 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
   episode_id UUID NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
   status VARCHAR(50) NOT NULL DEFAULT 'pending',
   error_message TEXT,
+  progress INTEGER DEFAULT 0,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_episode_id ON processing_jobs(episode_id);
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_one_active ON processing_jobs(episode_id) WHERE status IN ('pending', 'processing');
 
 -- Recording Chunks table
 CREATE TABLE IF NOT EXISTS recording_chunks (

@@ -1,63 +1,63 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { withAuth, AuthenticatedRequest } from '@/lib/auth/middleware';
-import { getSessionById, updateSessionState } from '@/lib/db/queries/sessions';
-import { verifyChunkIntegrity, getSessionChunks } from '@/lib/db/queries/chunks';
-import { recordParticipantTimeline, getUploadsBySessionId } from '@/lib/db/queries/uploads';
-import { getEpisodesByHostId, createEpisode, getEpisodeBySessionId } from '@/lib/db/queries/episodes';
-import { createProcessingJobIfAbsent } from '@/lib/db/queries/processing-jobs';
+import { authorizeParticipantUpload } from '@/lib/auth/session-access';
+import { verifyChunkIntegrity } from '@/lib/db/queries/chunks';
+import { recordParticipantTimeline, discardEmptyTrack } from '@/lib/db/queries/uploads';
+import { isScreenTrack } from '@/lib/participants';
+import { completeSessionIfReady } from '@/lib/sessions/completion';
+
+function parseDate(value: unknown): Date | undefined {
+  if (typeof value !== 'string') return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
 
 /**
  * POST /api/upload/finalize
  *
- * Lightweight orchestration endpoint for recording completion.
- * Performs chunk integrity verification, stores recording & timeline metadata,
- * determines if all required participants have completed uploading, and
- * idempotently creates exactly ONE ProcessingJob using createProcessingJobIfAbsent().
+ * Called by each participant once all of their chunks are uploaded. Verifies chunk integrity,
+ * stores the participant's timeline, and — once every participant who recorded has finalized —
+ * idempotently creates exactly one ProcessingJob.
  *
- * Body: { sessionId, participantType, totalChunks, recordingDuration?, recordingStartedAt?, recordingEndedAt? }
- * Response: HTTP 202 Accepted { processingJobId?, status, episodeId }
+ * Body: { sessionId, participantType, totalChunks, recordingStartedAt?, recordingEndedAt? }
+ * A screen share (or, with acceptMissing, any track) may finalize with totalChunks = 0: nothing was recorded.
+ * acceptMissing: true finalizes even if some chunks never arrived (they're lost on the client).
+ * Response: 202 { processingJobId?, status, episodeId }
  */
 export const POST = withAuth(async (req: AuthenticatedRequest) => {
   try {
-    const body = await req.json();
-    const {
-      sessionId,
-      participantType,
-      totalChunks,
-      recordingDuration,
-      recordingStartedAt,
-      recordingEndedAt,
-    } = body;
+    const { sessionId, participantType, totalChunks, recordingStartedAt, recordingEndedAt, acceptMissing } = await req.json();
 
-    if (!sessionId || !participantType || !totalChunks) {
-      return NextResponse.json(
-        { error: 'Missing required fields: sessionId, participantType, totalChunks' },
-        { status: 400 }
+    // An empty track: a screen share stopped instantly, or a recording the browser lost before its
+    // first chunk (e.g. the tab died within seconds). The server stops waiting for it.
+    const emptyScreenShare =
+      totalChunks === 0 && typeof participantType === 'string' && (isScreenTrack(participantType) || acceptMissing === true);
+    if (!Number.isInteger(totalChunks) || (totalChunks <= 0 && !emptyScreenShare)) {
+      return NextResponse.json({ error: 'totalChunks must be a positive integer' }, { status: 400 });
+    }
+
+    const access = await authorizeParticipantUpload(req, sessionId, participantType, { requireUploadable: false });
+    if (!access.ok) return access.response;
+    const { session } = access;
+
+    if (emptyScreenShare) {
+      await discardEmptyTrack(session.id, participantType);
+      return NextResponse.json(await completeSessionIfReady(session), { status: 202 });
+    }
+
+    const integrity = await verifyChunkIntegrity(session.id, participantType, totalChunks);
+    // The browser can declare chunks lost for good (e.g. the last seconds before a crash). The
+    // worker assembles around gaps, but it needs chunk 0, which carries the codec header.
+    const recoverable = acceptMissing === true && !integrity.missingIndices.includes(0) && !integrity.failedIndices.includes(0);
+    if (!integrity.valid && recoverable) {
+      console.warn(
+        `[finalize] ${session.id}/${participantType}: accepting with ${integrity.missingIndices.length + integrity.failedIndices.length} lost chunk(s)`
       );
     }
-
-    // 1. Verify session exists
-    const session = await getSessionById(sessionId);
-    if (!session) {
-      return NextResponse.json({ error: 'Session not found' }, { status: 404 });
-    }
-
-    // Verify ownership for host
-    if (participantType === 'host' && session.host_id !== req.userId) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 403 });
-    }
-
-    // 2. Verify chunk integrity (no gaps, all completed)
-    const integrity = await verifyChunkIntegrity(
-      sessionId,
-      participantType as 'host' | 'guest',
-      totalChunks
-    );
-
-    if (!integrity.valid) {
+    if (!integrity.valid && !recoverable) {
       return NextResponse.json(
         {
-          error: 'Chunk integrity check failed. Cannot finalize recording.',
+          error: 'Some recording chunks are missing. Retrying upload may fix this.',
           missingIndices: integrity.missingIndices,
           failedIndices: integrity.failedIndices,
           totalExpected: totalChunks,
@@ -67,70 +67,22 @@ export const POST = withAuth(async (req: AuthenticatedRequest) => {
       );
     }
 
-    // 3. Mark participant upload as completed & record timeline in DB
-    await recordParticipantTimeline(
-      sessionId,
-      participantType as 'host' | 'guest',
-      totalChunks,
-      recordingDuration,
-      recordingStartedAt,
-      recordingEndedAt
-    );
+    const startedAt = parseDate(recordingStartedAt);
+    const endedAt = parseDate(recordingEndedAt);
+    const durationSec = startedAt && endedAt ? Math.max(0, Math.round((endedAt.getTime() - startedAt.getTime()) / 1000)) : undefined;
 
-    // 4. Find existing episode or create a new episode for this session atomically
-    let episode = await getEpisodeBySessionId(sessionId);
+    await recordParticipantTimeline(session.id, participantType, totalChunks, durationSec, startedAt, endedAt);
 
-    if (!episode) {
-      episode = await createEpisode(sessionId, session.host_id);
-    }
-
-    // 5. Evaluate if ALL required participant uploads are completed
-    const uploads = await getUploadsBySessionId(sessionId);
-    const hostUpload = uploads.find((u) => u.participant_type === 'host' && u.status === 'completed');
-
-    // Check if guest participated (guest upload record exists or guest chunks uploaded)
-    const guestChunks = await getSessionChunks(sessionId, 'guest');
-    const guestUpload = uploads.find((u) => u.participant_type === 'guest');
-    const guestParticipated = (guestUpload !== undefined) || (guestChunks.length > 0);
-
-    const isGuestComplete = guestUpload ? guestUpload.status === 'completed' : false;
-
-    // All participants complete if:
-    // - Host upload is completed
-    // - AND IF a guest participated, guest upload is also completed
-    const allParticipantsComplete = hostUpload !== undefined && (!guestParticipated || isGuestComplete);
-
-    if (!allParticipantsComplete) {
-      return NextResponse.json(
-        {
-          status: 'waiting_for_participants',
-          message: 'Participant upload finalized. Waiting for remaining participant uploads to complete.',
-          episodeId: episode.id,
-        },
-        { status: 202 }
-      );
-    }
-
-    // 6. Update session state to processing
-    const sessionStart = recordingStartedAt ? new Date(recordingStartedAt) : session.recording_started_at || new Date();
-    await updateSessionState(sessionId, 'processing', sessionStart);
-
-    // 7. Idempotently create or retrieve existing ProcessingJob
-    const job = await createProcessingJobIfAbsent(episode.id);
-
+    // Processing starts once every participant who recorded (has an uploads row) has finalized.
+    const result = await completeSessionIfReady(session, { startedAt });
     return NextResponse.json(
-      {
-        processingJobId: job.id,
-        status: job.status,
-        episodeId: episode.id,
-      },
+      result.status === 'waiting_for_participants'
+        ? { ...result, message: 'Your track is uploaded. Waiting for the other participants to finish uploading.' }
+        : result,
       { status: 202 }
     );
   } catch (error) {
     console.error('Finalize upload error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
-});
+}, { allowGuest: true });

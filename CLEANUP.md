@@ -1,5 +1,11 @@
 # Storage Cleanup Guide
 
+> **Authentication required:** `POST /api/cleanup` only runs when the request carries
+> `Authorization: Bearer <CRON_SECRET>` and the server has the same `CRON_SECRET` set.
+> Without `CRON_SECRET` the endpoint is disabled. Retention comes from the server's
+> `EPISODE_RETENTION_DAYS`; it can no longer be overridden in the request body.
+> Stuck episodes are now marked **failed** (retryable from the project page), not deleted.
+
 This document explains how the automatic storage cleanup system works and how to configure it.
 
 > **See `STORAGE_ESTIMATES.md` for S3 storage cost estimates and file size calculations.**
@@ -54,8 +60,8 @@ You can trigger cleanup manually via the API endpoint:
 ```bash
 # Clean up old episodes
 curl -X POST http://localhost:3000/api/cleanup \
-  -H "Content-Type: application/json" \
-  -d '{"retentionDays": 7, "cleanupStuck": true}'
+  -H "Authorization: Bearer $CRON_SECRET" -H "Content-Type: application/json" \
+  -d '{"cleanupStuck": true}'
 ```
 
 Or check cleanup status:
@@ -92,16 +98,16 @@ Add to your crontab (`crontab -e`):
 
 ```bash
 # Run cleanup daily at 2 AM
-0 2 * * * curl -X POST http://localhost:3000/api/cleanup -H "Content-Type: application/json" -d '{"retentionDays": 7, "cleanupStuck": true}' >> /var/log/cleanup.log 2>&1
+0 2 * * * curl -X POST http://localhost:3000/api/cleanup -H "Authorization: Bearer $CRON_SECRET" -H "Content-Type: application/json" -d '{"cleanupStuck": true}' >> /var/log/cleanup.log 2>&1
 ```
 
 **For production with authentication (if you add auth later):**
 
 ```bash
 0 2 * * * curl -X POST https://yourdomain.com/api/cleanup \
-  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CRON_SECRET" -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_SECRET_TOKEN" \
-  -d '{"retentionDays": 7, "cleanupStuck": true}' \
+  -d '{"cleanupStuck": true}' \
   >> /var/log/cleanup.log 2>&1
 ```
 
@@ -141,7 +147,7 @@ services:
       sh -c "while true; do
         curl -X POST http://app:3000/api/cleanup
         -H 'Content-Type: application/json'
-        -d '{\"retentionDays\": 7, \"cleanupStuck\": true}';
+        -d '{\"cleanupStuck\": true}';
         sleep 86400;
       done"
     restart: unless-stopped

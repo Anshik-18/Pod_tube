@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server';
+import { withAuth } from '@/lib/auth/middleware';
+import { getCloudflareIceServers } from '@/lib/webrtc/cloudflare-turn';
 
 export const dynamic = 'force-dynamic';
 
@@ -27,12 +29,18 @@ function parseTurnUrl(rawUrl: string): { host: string; port: string } {
   return { host: parts[0], port: '443' };
 }
 
-export async function GET() {
+export const GET = withAuth(async () => {
+  // 1. Cloudflare Calls TURN (short-lived credentials), when configured.
+  const cloudflare = await getCloudflareIceServers();
+  if (cloudflare) {
+    return NextResponse.json({ iceServers: cloudflare, provider: 'cloudflare' }, { headers: { 'Cache-Control': 'no-store' } });
+  }
+
+  // 2. A static TURN server from TURN_SERVER_* env, else 3. a public fallback.
   const turnServerUrl = findEnvVar('TURN_SERVER_URL');
   const turnUsername = findEnvVar('TURN_SERVER_USERNAME');
   const turnPassword = findEnvVar('TURN_SERVER_PASSWORD');
 
-  const turnKeysFound = Object.keys(process.env).filter(k => k.toLowerCase().includes('turn') || k.toLowerCase().includes('metered'));
 
   const iceServers: RTCIceServer[] = [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -41,12 +49,10 @@ export async function GET() {
     { urls: 'stun:stun.services.mozilla.com' },
   ];
 
-  let usedSource = 'none';
 
   if (turnServerUrl && turnUsername && turnPassword) {
     const { host, port } = parseTurnUrl(turnServerUrl);
-    console.log('[WebRTC API Config] Using custom TURN server:', host, 'port:', port);
-    
+
     // Generate separate RTCIceServer entries per transport for maximum relay candidate generation
     iceServers.push(
       {
@@ -75,9 +81,7 @@ export async function GET() {
         credential: turnPassword,
       }
     );
-    usedSource = 'custom-env';
   } else {
-    console.log('[WebRTC API Config] Using Metered Open Relay TURN fallback.');
     iceServers.push(
       {
         urls: 'turn:openrelay.metered.ca:80',
@@ -105,15 +109,7 @@ export async function GET() {
         credential: 'openrelayproject',
       }
     );
-    usedSource = 'openrelay-fallback';
   }
 
-  return NextResponse.json({ 
-    iceServers,
-    debug: {
-      source: usedSource,
-      envKeysFound: turnKeysFound,
-      iceServerCount: iceServers.length,
-    }
-  });
-}
+  return NextResponse.json({ iceServers }, { headers: { 'Cache-Control': 'no-store' } });
+}, { allowGuest: true });

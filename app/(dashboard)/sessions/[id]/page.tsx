@@ -1,30 +1,49 @@
 'use client';
 
+import { sortParticipantIds } from '@/lib/participants';
+
 import { useEffect, useState } from 'react';
-import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Navbar } from '@/components/layout/Navbar';
-import { useAuth } from '@/components/providers/AuthProvider';
+import { useParams, useRouter } from 'next/navigation';
+import { ChevronRight, Copy, Check, Mail, Video, ArrowRight } from 'lucide-react';
+import { Button, ButtonLink } from '@/components/ui/Button';
+import { StatusBadge } from '@/components/ui/Badge';
+import { PageLoader } from '@/components/ui/Spinner';
+import { Avatar } from '@/components/ui/Avatar';
+import { api } from '@/lib/client/api';
+import { formatDateTime, formatClock } from '@/lib/client/format';
 
 interface Session {
   id: string;
+  title?: string | null;
   guest_token: string;
   state: string;
   recording_started_at: string | null;
   created_at: string;
+  markers?: Array<{ id: string; time: number; label: string }>;
+  participant_names?: Record<string, string>;
 }
 
 interface Episode {
   id: string;
+  session_id: string;
   title: string | null;
   state: string;
   created_at: string;
 }
 
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="card p-5">
+      <h2 className="mb-4 text-sm font-semibold">{title}</h2>
+      {children}
+    </section>
+  );
+}
+
 export default function SessionDetailPage() {
   const params = useParams();
   const router = useRouter();
-  const { user } = useAuth();
   const sessionId = params.id as string;
   const [session, setSession] = useState<Session | null>(null);
   const [episode, setEpisode] = useState<Episode | null>(null);
@@ -32,225 +51,162 @@ export default function SessionDetailPage() {
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    if (!user) return;
-
-    const fetchSessionDetails = async () => {
+    let cancelled = false;
+    (async () => {
       try {
-        const token = localStorage.getItem('token');
-        const response = await fetch(`/api/sessions/${sessionId}`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-
-        if (!response.ok) {
-          router.push('/sessions');
-          return;
-        }
-
-        const data = await response.json();
+        const data = await api<{ session: Session }>(`/api/sessions/${sessionId}`);
+        if (cancelled) return;
         setSession(data.session);
-
-        const episodesResponse = await fetch('/api/episodes', {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-
-        if (episodesResponse.ok) {
-          const episodesData = await episodesResponse.json();
-          const associatedEpisode = episodesData.episodes.find(
-            (ep: Episode & { session_id: string }) => ep.session_id === sessionId
-          );
-          if (associatedEpisode) {
-            setEpisode(associatedEpisode);
-          }
-        }
-      } catch (error) {
-        console.error('Error fetching session details:', error);
+        const episodes = await api<{ episodes: Episode[] }>('/api/episodes').catch(() => ({ episodes: [] as Episode[] }));
+        if (!cancelled) setEpisode(episodes.episodes.find((ep) => ep.session_id === sessionId) ?? null);
+      } catch {
         router.push('/sessions');
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
+    })();
+    return () => {
+      cancelled = true;
     };
+  }, [sessionId, router]);
 
-    fetchSessionDetails();
-  }, [sessionId, user, router]);
+  if (loading) return <PageLoader label="Loading session…" />;
+  if (!session) return null;
 
-  const formatDate = (dateString: string) => {
-    return new Date(dateString).toLocaleString();
-  };
+  const inviteLink = typeof window !== 'undefined' ? `${window.location.origin}/join/${session.guest_token}` : '';
+  const title = session.title || 'Untitled recording';
+  const canJoin = session.state === 'idle' || session.state === 'recording';
+  const names = session.participant_names ?? {};
+  const markers = session.markers ?? [];
 
-  const getStateBadgeColor = (state: string) => {
-    switch (state) {
-      case 'idle':
-        return 'bg-zinc-800 text-zinc-400 border border-zinc-700';
-      case 'recording':
-        return 'bg-red-500/10 text-red-400 border border-red-500/20';
-      case 'uploading':
-        return 'bg-amber-500/10 text-amber-400 border border-amber-500/20';
-      case 'completed':
-      case 'ready':
-        return 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
-      default:
-        return 'bg-zinc-800 text-zinc-400 border border-zinc-700';
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // ignore: link is selectable
     }
   };
 
-  if (loading) {
-    return (
-      <div className="min-h-[50vh] flex items-center justify-center text-zinc-400 text-sm">
-        Loading session details...
-      </div>
-    );
-  }
+  const email = () => {
+    const subject = encodeURIComponent(`Join me in the studio: ${title}`);
+    const body = encodeURIComponent(`Hi,\n\nJoin my recording session here: ${inviteLink}\n\nNo account needed — just open the link in Chrome or Edge.\n`);
+    window.open(`mailto:?subject=${subject}&body=${body}`, '_blank');
+  };
 
-  if (!session) {
-    return null;
-  }
-
-  const guestInviteUrl = typeof window !== 'undefined' ? `${window.location.origin}/join/${session.guest_token}` : '';
+  const timeline = [
+    { label: 'Session Created', at: session.created_at, color: 'bg-brand' },
+    ...(session.recording_started_at ? [{ label: 'Recording Started', at: session.recording_started_at, color: 'bg-rec' }] : []),
+    ...(episode ? [{ label: 'Episode Created', at: episode.created_at, color: 'bg-emerald-400' }] : []),
+  ];
 
   return (
-    <div className="max-w-4xl mx-auto py-4 space-y-6">
-      <div className="hidden"><Navbar /></div>
-      <div>
-        <button
-          onClick={() => router.push('/sessions')}
-          className="text-xs text-zinc-400 hover:text-white flex items-center gap-1.5 mb-3 transition-colors"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-          </svg>
-          <span>Back to Sessions</span>
-        </button>
-        <h1 className="text-3xl font-bold text-white tracking-tight">Session Details</h1>
-      </div>
-
-      {/* Session Information */}
-      <div className="bg-[#1a1a1a] border border-[#282828] rounded-2xl p-6 shadow-xl space-y-4">
-        <h2 className="text-lg font-bold text-white">Session Information</h2>
-        <dl className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-          <div className="p-3 bg-[#121212] border border-[#282828] rounded-xl space-y-1">
-            <dt className="text-zinc-500 font-semibold uppercase tracking-wider">Session ID</dt>
-            <dd className="text-white font-mono text-xs">{session.id}</dd>
-          </div>
-          <div className="p-3 bg-[#121212] border border-[#282828] rounded-xl space-y-1">
-            <dt className="text-zinc-500 font-semibold uppercase tracking-wider">Status</dt>
-            <dd className="mt-1">
-              <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium uppercase tracking-wider ${getStateBadgeColor(session.state)}`}>
-                {session.state === 'completed' ? 'Completed' : session.state}
-              </span>
-            </dd>
-          </div>
-          <div className="p-3 bg-[#121212] border border-[#282828] rounded-xl space-y-1">
-            <dt className="text-zinc-500 font-semibold uppercase tracking-wider">Created At</dt>
-            <dd className="text-white">{formatDate(session.created_at)}</dd>
-          </div>
-          {session.recording_started_at && (
-            <div className="p-3 bg-[#121212] border border-[#282828] rounded-xl space-y-1">
-              <dt className="text-zinc-500 font-semibold uppercase tracking-wider">Recording Started</dt>
-              <dd className="text-white">{formatDate(session.recording_started_at)}</dd>
-            </div>
-          )}
-        </dl>
-      </div>
-
-      {/* Guest Invitation Link Box */}
-      <div className="bg-[#1a1a1a] border border-[#282828] rounded-2xl p-6 shadow-xl space-y-4">
-        <h2 className="text-lg font-bold text-white">Guest Invitation Link</h2>
-        <div className="flex items-center gap-2">
-          <input
-            type="text"
-            readOnly
-            value={guestInviteUrl}
-            className="flex-1 px-4 py-2.5 bg-[#121212] border border-[#282828] rounded-xl text-white font-mono text-xs focus:outline-none"
-          />
-          <button
-            onClick={() => {
-              if (guestInviteUrl) {
-                navigator.clipboard.writeText(guestInviteUrl);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 2000);
-              }
-            }}
-            className="px-4 py-2.5 bg-[#6e56f8] hover:bg-[#5b45e0] text-white font-medium rounded-xl transition-all text-xs shadow-lg shadow-[#6e56f8]/20 shrink-0"
-          >
-            {copied ? 'Copied!' : 'Copy'}
-          </button>
-          <button
-            onClick={() => {}}
-            className="p-2.5 bg-zinc-800 text-zinc-300 hover:text-white rounded-xl text-xs font-medium"
-            title="Send via email"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-            </svg>
-          </button>
+    <div className="mx-auto max-w-4xl">
+      <nav className="mb-1 flex items-center gap-1 text-xs text-ink-faint">
+        <Link href="/sessions" className="hover:text-ink">Studios</Link>
+        <ChevronRight className="h-3 w-3" />
+        <span>Session Details</span>
+      </nav>
+      <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+          <StatusBadge state={session.state} />
         </div>
-        <p className="text-xs text-zinc-400">
-          Share this link with guests to allow them to join the recording session. Copy the link or send it via email.
-        </p>
-      </div>
-
-      {/* Associated Episode Box */}
-      <div className="bg-[#1a1a1a] border border-[#282828] rounded-2xl p-6 shadow-xl space-y-4">
-        <h2 className="text-lg font-bold text-white">Associated Episode</h2>
-        {episode ? (
-          <div className="flex items-center justify-between">
-            <div className="space-y-1">
-              <h3 className="text-base font-semibold text-white">
-                {episode.title || `Episode ${episode.id.slice(0, 8)}`}
-              </h3>
-              <p className="text-xs text-zinc-400">
-                Created: {formatDate(episode.created_at)}
-              </p>
-            </div>
-            <Link
-              href={`/episodes/${episode.id}`}
-              className="px-4 py-2 bg-[#6e56f8] hover:bg-[#5b45e0] text-white font-medium rounded-xl text-xs transition-colors shadow-lg shadow-[#6e56f8]/20"
-            >
-              View Episode
-            </Link>
-          </div>
-        ) : (
-          <p className="text-xs text-zinc-400">No episode has been created from this session yet.</p>
+        {session.state === 'idle' && (
+          <ButtonLink href={`/record/${session.id}`} variant="record">
+            <Video className="h-4 w-4" />
+            Enter studio
+          </ButtonLink>
         )}
       </div>
 
-      {/* Timeline */}
-      <div className="bg-[#1a1a1a] border border-[#282828] rounded-2xl p-6 shadow-xl space-y-4">
-        <h2 className="text-lg font-bold text-white">Session Timeline</h2>
-        <div className="space-y-4">
-          <div className="flex items-start">
-            <div className="flex-shrink-0 w-2 h-2 bg-[#6e56f8] rounded-full mt-1.5"></div>
-            <div className="ml-3">
-              <p className="text-xs font-semibold text-white">Session Created</p>
-              <p className="text-xs text-zinc-500">{formatDate(session.created_at)}</p>
+      <div className="grid gap-4 md:grid-cols-2">
+        <Card title="Session Information">
+          <dl className="space-y-3 text-sm">
+            <div>
+              <dt className="text-xs text-ink-faint">Session ID</dt>
+              <dd className="mt-0.5 font-mono text-xs text-ink-muted">{session.id}</dd>
             </div>
+            <div>
+              <dt className="text-xs text-ink-faint">Created</dt>
+              <dd className="mt-0.5">{formatDateTime(session.created_at)}</dd>
+            </div>
+            {Object.keys(names).length > 0 && (
+              <div>
+                <dt className="text-xs text-ink-faint">Participants</dt>
+                <dd className="mt-1.5 flex flex-wrap gap-3">
+                  {sortParticipantIds(Object.keys(names)).filter((id) => names[id]).map((id) => (
+                    <span key={id} className="flex items-center gap-2">
+                      <Avatar name={names[id]} size={24} />
+                      <span>{names[id]}</span>
+                      <span className="text-xs text-ink-faint">{id === 'host' ? 'Host' : 'Guest'}</span>
+                    </span>
+                  ))}
+                </dd>
+              </div>
+            )}
+          </dl>
+        </Card>
+
+        <Card title="Associated Episode">
+          {episode ? (
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="truncate text-sm font-medium">{episode.title || 'Untitled recording'}</h3>
+                <p className="mt-0.5 text-xs text-ink-faint">Created {formatDateTime(episode.created_at)}</p>
+              </div>
+              <ButtonLink href={`/episodes/${episode.id}`} size="sm">
+                View Episode
+                <ArrowRight className="h-3.5 w-3.5" />
+              </ButtonLink>
+            </div>
+          ) : (
+            <p className="text-sm text-ink-muted">No episode has been created from this session yet.</p>
+          )}
+        </Card>
+
+        <Card title="Guest Invitation Link">
+          <div className="flex gap-2">
+            <input readOnly value={inviteLink} onFocus={(e) => e.currentTarget.select()} className="input font-mono text-xs" />
+            <Button variant="secondary" onClick={copy} disabled={!canJoin}>
+              {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+              {copied ? 'Copied' : 'Copy'}
+            </Button>
+            <Button variant="secondary" size="icon" onClick={email} title="Send via email" disabled={!canJoin}>
+              <Mail className="h-4 w-4" />
+            </Button>
           </div>
-          {session.recording_started_at && (
-            <div className="flex items-start">
-              <div className="flex-shrink-0 w-2 h-2 bg-red-500 rounded-full mt-1.5"></div>
-              <div className="ml-3">
-                <p className="text-xs font-semibold text-white">Recording Started</p>
-                <p className="text-xs text-zinc-500">{formatDate(session.recording_started_at)}</p>
-              </div>
+          <p className="mt-2 text-xs text-ink-faint">
+            {canJoin ? 'Guests join from their browser — no account or download needed.' : 'This session has finished recording, so the link no longer admits guests.'}
+          </p>
+        </Card>
+
+        <Card title="Session Timeline">
+          <ol className="relative space-y-4 border-l border-line pl-5">
+            {timeline.map((item) => (
+              <li key={item.label} className="relative">
+                <span className={`absolute -left-[25px] top-1 h-2.5 w-2.5 rounded-full ring-4 ring-surface ${item.color}`} />
+                <p className="text-sm font-medium">{item.label}</p>
+                <p className="text-xs text-ink-faint">{formatDateTime(item.at)}</p>
+              </li>
+            ))}
+          </ol>
+          {markers.length > 0 && (
+            <div className="mt-5 border-t border-line pt-4">
+              <p className="mb-2 text-xs text-ink-faint">{markers.length} marker{markers.length === 1 ? '' : 's'}</p>
+              <ul className="space-y-1 text-sm">
+                {markers.map((m) => (
+                  <li key={m.id} className="flex gap-3">
+                    <span className="font-mono text-xs text-brand-light">{formatClock(m.time)}</span>
+                    <span className="truncate text-ink-muted">{m.label}</span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
-          {episode && (
-            <div className="flex items-start">
-              <div className="flex-shrink-0 w-2 h-2 bg-emerald-500 rounded-full mt-1.5"></div>
-              <div className="ml-3">
-                <p className="text-xs font-semibold text-white">Episode Created</p>
-                <p className="text-xs text-zinc-500">{formatDate(episode.created_at)}</p>
-              </div>
-            </div>
-          )}
-        </div>
+        </Card>
       </div>
     </div>
   );
 }
-
-

@@ -1,58 +1,43 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { createUser } from '@/lib/db/queries/users';
+import { createUser, getUserByEmail, toPublicUser } from '@/lib/db/queries/users';
 import { hashPassword } from '@/lib/auth/password';
 import { signToken } from '@/lib/auth/jwt';
+import { setAuthCookie } from '@/lib/auth/cookie';
+import { clientIp, rateLimit } from '@/lib/auth/rate-limit';
 
 const signupSchema = z.object({
-  email: z.string().email(),
+  name: z.string().trim().max(60).optional(),
+  email: z.string().trim().email(),
   password: z.string().min(8),
 });
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { email, password } = signupSchema.parse(body);
-
-    // Check if user already exists
-    const { getUserByEmail } = await import('@/lib/db/queries/users');
-    const existingUser = await getUserByEmail(email);
-    if (existingUser) {
-      return NextResponse.json(
-        { error: 'User with this email already exists' },
-        { status: 400 }
-      );
+    const limit = rateLimit(`signup:${clientIp(req)}`, 5, 60_000);
+    if (!limit.ok) {
+      return NextResponse.json({ error: 'Too many attempts. Please wait a minute.' }, { status: 429 });
     }
 
-    // Create user
-    const passwordHash = await hashPassword(password);
-    const user = await createUser(email, passwordHash);
+    const { name, email, password } = signupSchema.parse(await req.json());
 
-    // Generate token
+    if (await getUserByEmail(email)) {
+      return NextResponse.json({ error: 'An account with this email already exists' }, { status: 400 });
+    }
+
+    const user = await createUser(email, await hashPassword(password), name || null);
     const token = signToken({ userId: user.id, email: user.email });
 
-    const response = NextResponse.json({
-      user: { id: user.id, email: user.email },
-      token,
-    });
-
-    // Set cookie
-    response.cookies.set('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 60 * 60 * 24 * 7, // 7 days
-    });
-
+    const response = NextResponse.json({ user: toPublicUser(user), token });
+    setAuthCookie(response, token);
     return response;
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return NextResponse.json({ error: error.errors }, { status: 400 });
+      const field = error.errors[0]?.path[0];
+      const message = field === 'password' ? 'Password must be at least 8 characters' : 'Enter a valid email address';
+      return NextResponse.json({ error: message }, { status: 400 });
     }
     console.error('Signup error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
