@@ -8,6 +8,7 @@ import {
 import { getEpisodeById, updateEpisodeState } from '../db/queries/episodes';
 import { updateSessionState } from '../db/queries/sessions';
 import { finishStalledSessions } from '../sessions/completion';
+import { getProcessingResources } from './resources';
 
 /** A session waiting on uploads that show no activity for this long is processed with what arrived. */
 const STALLED_UPLOAD_MINUTES = 10;
@@ -79,6 +80,11 @@ export class ProcessingWorker {
 
     this.isRunning = true;
     console.log(`[Worker] Worker started (polling every ${this.pollIntervalMs}ms)`);
+    const r = getProcessingResources();
+    console.log(
+      `[Worker] Resources: ${r.cpus} CPU, ${r.memoryBytes ? `${Math.round(r.memoryBytes / 1048576)} MB` : 'no memory limit'} -> ` +
+        `${r.threads} FFmpeg thread(s), exports up to '${r.maxQuality}'${r.maxQuality === 'low' ? ' (720p)' : ''}`
+    );
     this.scheduleNextPoll(0);
     return true;
   }
