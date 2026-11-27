@@ -220,7 +220,15 @@ export function planScenes(inputs: SceneInput[], from: number, to: number): Scen
 
 export function buildRenderPlan(
   inputs: SceneInput[],
-  options: { workDir: string; outputFile: string; trim?: TrimSettings | null; sourceHeight?: number | null; videoEncoder?: VideoEncoder }
+  options: {
+    workDir: string;
+    outputFile: string;
+    trim?: TrimSettings | null;
+    sourceHeight?: number | null;
+    videoEncoder?: VideoEncoder;
+    /** FFmpeg threads per decoder/filter/encoder; omit to let FFmpeg decide. */
+    threads?: number;
+  }
 ): RenderPlan {
   const cameras = inputs.filter((i) => !i.isScreen);
   if (cameras.length === 0) throw new Error('Expected at least one participant camera track, got none');
@@ -248,16 +256,17 @@ export function buildRenderPlan(
       ? ['-c:v', 'libopenh264', '-b:v', quality.videoBitrate, '-maxrate', quality.videoBitrate, '-g', String(FPS * 2)]
       : ['-c:v', 'libx264', '-preset', quality.preset, '-crf', String(quality.crf), '-g', String(FPS * 2)];
   const gap = Math.round(width / 80);
+  const threads = options.threads && options.threads > 0 ? options.threads : null;
 
   const scenes = planScenes(inputs, trimStart, trimEnd).map((scene, n) => {
     const frames = Math.max(1, Math.round((scene.end - scene.start) * FPS));
     const file = `${options.workDir}/scene_${String(n).padStart(4, '0')}.ts`;
-    return { ...scene, file, frames, pass: buildScenePass(scene, inputs, { width, height, gap, frames, file, encoder }) };
+    return { ...scene, file, frames, pass: buildScenePass(scene, inputs, { width, height, gap, frames, file, encoder, threads }) };
   });
   const outputDurationSec = scenes.reduce((n, s) => n + s.frames / FPS, 0);
 
   const audioFile = `${options.workDir}/audio.m4a`;
-  const audio = { file: audioFile, ...buildAudioPass(inputs, { trimStart, trimEnd, timelineDurationSec, bitrate: quality.audioBitrate, file: audioFile }) };
+  const audio = { file: audioFile, ...buildAudioPass(inputs, { trimStart, trimEnd, timelineDurationSec, bitrate: quality.audioBitrate, file: audioFile, threads }) };
 
   const concatList = scenes.map((s) => `file '${s.file.replace(/'/g, "'\\''")}'\nduration ${fmt(s.frames / FPS)}`).join('\n') + '\n';
   const mux: RenderPass = {
@@ -279,7 +288,7 @@ export function buildRenderPlan(
 function buildScenePass(
   scene: Scene,
   inputs: SceneInput[],
-  o: { width: number; height: number; gap: number; frames: number; file: string; encoder: string[] }
+  o: { width: number; height: number; gap: number; frames: number; file: string; encoder: string[]; threads: number | null }
 ): RenderPass {
   const dur = o.frames / FPS;
   const { width, height, gap } = o;
@@ -292,6 +301,7 @@ function buildScenePass(
     const seek = Math.max(0, scene.start - input.offsetSec);
     const lateBy = Math.max(0, input.offsetSec - scene.start);
     if (seek > 0) args.push('-ss', fmt(seek));
+    if (o.threads) args.push('-threads', String(o.threads));
     args.push('-t', fmt(dur - lateBy + 0.5), '-i', input.file);
     return { idx: next++, lateBy };
   };
@@ -337,9 +347,11 @@ function buildScenePass(
   if (layers.length === 0) filters.push('[base]null[vout]');
 
   args.push(
+    ...(o.threads ? ['-filter_complex_threads', String(o.threads)] : []),
     '-filter_complex', filters.join(';'),
     '-map', '[vout]', '-an',
     ...o.encoder,
+    ...(o.threads ? ['-threads', String(o.threads)] : []),
     '-pix_fmt', 'yuv420p', '-r', String(FPS),
     '-frames:v', String(o.frames),
     '-f', 'mpegts', o.file
@@ -349,7 +361,7 @@ function buildScenePass(
 
 function buildAudioPass(
   inputs: SceneInput[],
-  o: { trimStart: number; trimEnd: number; timelineDurationSec: number; bitrate: string; file: string }
+  o: { trimStart: number; trimEnd: number; timelineDurationSec: number; bitrate: string; file: string; threads?: number | null }
 ): RenderPass {
   const sources = inputs.filter((i) => i.hasAudio && i.offsetSec < o.trimEnd && i.offsetSec + i.durationSec > o.trimStart);
   const args: string[] = [];
@@ -361,6 +373,7 @@ function buildAudioPass(
     filters.push('[0:a]anull[aout]');
   } else {
     sources.forEach((src, i) => {
+      if (o.threads) args.push('-threads', String(o.threads));
       args.push('-i', src.file);
       const delayMs = Math.round(src.offsetSec * 1000);
       filters.push(

@@ -4,6 +4,7 @@ import { ConcatStageResult } from './concat-chunks';
 import { SessionTimeline } from './timeline';
 import { runFFmpeg, probeMedia, getVideoEncoder } from './ffmpeg';
 import { buildRenderPlan, SceneInput } from './scenes';
+import { clampQuality, getProcessingResources } from './resources';
 import type { TrimSettings } from '../db/queries/episodes';
 import { baseParticipant, isScreenTrack } from '../participants';
 
@@ -73,7 +74,21 @@ export async function mergeStage(
   const inputs = timelineInputs(concatResult, timeline);
   const firstCamera = inputs.find((i) => !i.isScreen);
   const sourceHeight = firstCamera ? concatResult.participants[firstCamera.participantType]?.media.height ?? null : null;
-  const plan = buildRenderPlan(inputs, { workDir, outputFile, trim, sourceHeight, videoEncoder: await getVideoEncoder() });
+  // Fit the render to this machine: thread count from the container's CPUs, and 720p on small
+  // instances where 1080p wouldn't fit in memory.
+  const resources = getProcessingResources();
+  const quality = clampQuality(trim?.quality, resources.maxQuality);
+  if (quality !== (trim?.quality ?? 'medium')) {
+    console.log(`[MergeStage] Job ${jobId}: rendering at '${quality}' (requested '${trim?.quality ?? 'medium'}'; this instance's limit)`);
+  }
+  const plan = buildRenderPlan(inputs, {
+    workDir,
+    outputFile,
+    trim: { ...(trim ?? {}), quality },
+    sourceHeight,
+    videoEncoder: await getVideoEncoder(),
+    threads: resources.threads,
+  });
 
   console.log(
     `[MergeStage] Job ${jobId}: ${plan.width}x${plan.height}, ${plan.outputDurationSec.toFixed(1)}s in ${plan.scenes.length} scene(s): ` +

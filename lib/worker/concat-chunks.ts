@@ -2,7 +2,8 @@ import fs from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import path from 'path';
 import { JobDownloadResult, ParticipantType } from './download-chunks';
-import { runFFmpeg, probeMedia, probeVideoPackets, MediaInfo } from './ffmpeg';
+import { runFFmpeg, probeMedia, probeVideoPackets, getVideoEncoder, MediaInfo } from './ffmpeg';
+import { getProcessingResources } from './resources';
 import { planGapRepair, TrackGap } from './gap-repair';
 
 export interface ParticipantConcatOutput {
@@ -102,19 +103,37 @@ export async function concatStage(downloadResult: JobDownloadResult): Promise<Co
       const joined = path.join(workingDirectory, `${participantType}.joined.webm`);
       await joinChunks(sorted.map((c) => c.localPath), joined);
 
-      // WebM for Chrome/Firefox (VP8/VP9/Opus); Matroska accepts Safari's H.264/AAC too.
+      // Matroska accepts every codec browsers record (VP8/VP9/H.264/Opus/AAC). If a stream can't be
+      // copied — e.g. a screen share's audio track that never carried any audio — keep the streams
+      // that have data rather than losing the whole track.
       outputFile = '';
-      for (const ext of ['webm', 'mkv']) {
-        const candidate = path.join(workingDirectory, `${participantType}.${ext}`);
+      // Occasionally Chrome writes a stream header FFmpeg can decode but not copy (seen with screen
+      // shares whose recording starts before the first frame). Then the video is re-encoded rather
+      // than dropped; audio-only is the last resort.
+      const encoder = await getVideoEncoder();
+      const reencode =
+        encoder === 'libopenh264'
+          ? ['-c:v', 'libopenh264', '-b:v', '4000k']
+          : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-pix_fmt', 'yuv420p'];
+      const threads = getProcessingResources().threads;
+      const attempts: Array<{ label: string; args: string[] }> = [
+        { label: 'copy', args: ['-map', '0', '-c', 'copy'] },
+        { label: 'copy video', args: ['-map', '0:v', '-c', 'copy'] },
+        { label: 're-encode video', args: ['-map', '0:v', ...reencode, '-threads', String(threads), '-map', '0:a?', '-c:a', 'copy'] },
+        { label: 're-encode video only', args: ['-map', '0:v', ...reencode, '-threads', String(threads)] },
+        { label: 'copy audio only', args: ['-map', '0:a', '-c', 'copy'] },
+      ];
+      for (const { label, args } of attempts) {
+        const candidate = path.join(workingDirectory, `${participantType}.mkv`);
         try {
-          await runFFmpeg(['-fflags', '+genpts', '-i', joined, '-map', '0', '-c', 'copy', candidate], {
-            label: `remux ${participantType} to ${ext}`,
-          });
+          await runFFmpeg(['-fflags', '+genpts', '-i', joined, ...args, candidate], { label: `remux ${participantType} (${label})` });
           outputFile = candidate;
+          if (label !== 'copy') console.warn(`[ConcatStage] ${participantType}: assembled with '${label}'`);
           break;
         } catch (err) {
           await fs.rm(candidate, { force: true });
-          console.warn(`[ConcatStage] Remux to ${ext} failed for ${participantType}:`, (err as Error).message.split('\n')[0]);
+          const lines = (err as Error).message.split('\n');
+          console.warn(`[ConcatStage] ${participantType}: '${label}' failed: ${lines[0]} | ${lines.slice(-2).join(' / ')}`);
         }
       }
       if (outputFile) {
